@@ -1,0 +1,8 @@
+pyqt5
+pyqtgraph
+numpy
+pandas
+OBD
+pyserial>=3.5
+bleak
+
