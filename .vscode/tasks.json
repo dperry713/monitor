@@ -1,0 +1,14 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "shell",
+      "label": "Compile Python to EXE with PyInstaller",
+      "command": "pyinstaller",
+      "args": ["--onefile", "--windowed", "tool.py"],
+      "problemMatcher": [],
+      "group": "build",
+      "isBackground": false
+    }
+  ]
+}
