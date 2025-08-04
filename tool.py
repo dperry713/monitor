@@ -467,6 +467,26 @@ class OBDApp(QMainWindow):
         self.connect_btn.clicked.connect(self.connect_obd)
         button_layout.addWidget(self.connect_btn)
 
+        # Add disconnect button
+        self.disconnect_btn = QPushButton("🔌 Disconnect")
+        self.disconnect_btn.setMinimumHeight(50)
+        self.disconnect_btn.setEnabled(False)
+        self.disconnect_btn.clicked.connect(self.disconnect_obd)
+        self.disconnect_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {MODERN_STYLE['error']};
+                color: {MODERN_STYLE['text']};
+            }}
+            QPushButton:hover {{
+                background-color: #ff4757;
+            }}
+            QPushButton:disabled {{
+                background-color: {MODERN_STYLE['border']};
+                color: {MODERN_STYLE['text_secondary']};
+            }}
+        """)
+        button_layout.addWidget(self.disconnect_btn)
+
         connection_layout.addWidget(button_container)
 
         # Status section
@@ -499,12 +519,27 @@ class OBDApp(QMainWindow):
         bt_info_layout = QVBoxLayout(bt_info_group)
 
         bt_instructions = QLabel("""
-<b>For Bluetooth OBD adapters:</b><br/>
-1. Pair your OBD adapter in Windows Bluetooth settings first<br/>
-2. Note the COM port assigned (usually COM3-COM20)<br/>
-3. Use 'Scan Bluetooth' button to detect paired devices<br/>
-4. Default PIN is usually: 1234 or 0000<br/>
-5. Connection may take 5-10 seconds for Bluetooth
+<b>📱 Bluetooth OBD Connection Guide:</b><br/>
+<b>1. Pairing (First Time):</b><br/>
+   • Go to Windows Settings → Devices → Bluetooth<br/>
+   • Make sure Bluetooth is ON<br/>
+   • Put your OBD adapter in pairing mode (usually automatic)<br/>
+   • Click "Add Bluetooth or other device" → Bluetooth<br/>
+   • Select your OBD device (usually ELM327, OBD2, etc.)<br/>
+   • Enter PIN: 1234 or 0000 (most common)<br/><br/>
+
+<b>2. Before Connecting:</b><br/>
+   • Plug OBD adapter into your vehicle's diagnostic port<br/>
+   • Turn vehicle ignition to ON position (engine can be off)<br/>
+   • Wait 10-15 seconds for adapter to initialize<br/>
+   • Some adapters require engine to be running<br/><br/>
+
+<b>3. Troubleshooting:</b><br/>
+   • Use "Scan Bluetooth" to find paired devices automatically<br/>
+   • Check Windows Device Manager for COM port assignment<br/>
+   • Try "Refresh Ports" if device doesn't appear<br/>
+   • Connection may take 10-15 seconds for Bluetooth<br/>
+   • If connection fails, try turning Bluetooth off/on in Windows
         """)
         bt_instructions.setWordWrap(True)
         bt_instructions.setStyleSheet("""
@@ -512,8 +547,9 @@ class OBDApp(QMainWindow):
                 color: #cccccc;
                 background-color: rgba(120, 120, 120, 0.1);
                 border-radius: 6px;
-                padding: 10px;
+                padding: 15px;
                 margin: 5px;
+                line-height: 1.4;
             }
         """)
         bt_info_layout.addWidget(bt_instructions)
@@ -968,147 +1004,355 @@ class OBDApp(QMainWindow):
             f"[O2 DISPLAY] Changed to {current_format}, logging headers updated")
 
     def scan_bluetooth(self):
-        """Scan for Bluetooth devices and add them to the port list"""
+        """Scan for paired Bluetooth OBD devices and add them to the port list"""
         import platform
         if platform.system() != "Windows":
             self.update_status(
                 "Bluetooth scan only supported on Windows", "warning")
             return
 
-        self.update_status("Scanning for Bluetooth devices...", "warning")
+        self.update_status(
+            "Scanning for paired Bluetooth OBD devices...", "warning")
 
         try:
-            # Try to use Windows Bluetooth API
             import subprocess
             import re
 
-            # Use PowerShell to get Bluetooth devices
+            # Enhanced PowerShell command to find paired Bluetooth devices with COM ports
             ps_command = """
+            # Get paired Bluetooth devices with COM ports
+            $devices = @()
+            
+            # Method 1: Check WMI for Bluetooth COM devices
             Get-WmiObject -Class Win32_PnPEntity | Where-Object {
-                $_.Name -like "*bluetooth*" -and $_.Name -like "*com*"
-            } | Select-Object Name, DeviceID
+                $_.Name -match "COM\d+" -and ($_.Name -match "Bluetooth|BT" -or $_.DeviceID -match "BTHENUM")
+            } | ForEach-Object {
+                if ($_.Name -match "(COM\d+)") {
+                    $devices += [PSCustomObject]@{
+                        Port = $matches[1]
+                        Name = $_.Name
+                        Type = "Bluetooth"
+                        Status = "Paired"
+                    }
+                }
+            }
+            
+            # Method 2: Check registry for Bluetooth serial ports
+            try {
+                $regKey = Get-ItemProperty "HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM" -ErrorAction SilentlyContinue
+                if ($regKey) {
+                    $regKey.PSObject.Properties | Where-Object {
+                        $_.Name -match "BthModem|Bluetooth" -and $_.Value -match "COM\d+"
+                    } | ForEach-Object {
+                        $comPort = $_.Value
+                        if (-not ($devices | Where-Object { $_.Port -eq $comPort })) {
+                            $devices += [PSCustomObject]@{
+                                Port = $comPort
+                                Name = "Bluetooth Serial Port"
+                                Type = "Bluetooth"
+                                Status = "Paired"
+                            }
+                        }
+                    }
+                }
+            } catch {}
+            
+            # Method 3: Check common OBD Bluetooth ports by attempting connection
+            1..20 | ForEach-Object {
+                $port = "COM$_"
+                if (-not ($devices | Where-Object { $_.Port -eq $port })) {
+                    try {
+                        $serial = New-Object System.IO.Ports.SerialPort($port, 38400)
+                        $serial.ReadTimeout = 100
+                        $serial.WriteTimeout = 100
+                        $serial.Open()
+                        Start-Sleep -Milliseconds 50
+                        $serial.Close()
+                        
+                        # If we can open the port, it might be a Bluetooth device
+                        $devices += [PSCustomObject]@{
+                            Port = $port
+                            Name = "Available Serial Port (Potential OBD)"
+                            Type = "Serial"
+                            Status = "Available"
+                        }
+                    } catch {
+                        # Port not available or in use
+                    }
+                }
+            }
+            
+            # Output results
+            $devices | Sort-Object Port | ForEach-Object {
+                Write-Output "$($_.Port)|$($_.Name)|$($_.Type)|$($_.Status)"
+            }
             """
 
             result = subprocess.run(
                 ["powershell", "-Command", ps_command],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=15
             )
 
-            if result.returncode == 0 and result.stdout:
-                # Parse the output to find COM ports
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'COM' in line.upper():
-                        # Extract COM port number
-                        com_match = re.search(r'COM\d+', line.upper())
-                        if com_match:
-                            com_port = com_match.group()
-                            device_name = line.strip()
-                            # Add to port list if not already there
-                            existing_ports = [self.port_select.itemData(
-                                j) for j in range(self.port_select.count())]
-                            if com_port not in existing_ports:
-                                self.port_select.addItem(
-                                    f"{com_port} (Bluetooth - {device_name})", com_port)
+            bt_devices_found = 0
+            existing_ports = [self.port_select.itemData(
+                j) for j in range(self.port_select.count())]
 
-                self.update_status("Bluetooth scan completed", "success")
-            else:
-                # Fallback: try common Bluetooth COM ports
-                bt_ports_found = 0
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if '|' in line:
+                        try:
+                            parts = line.split('|')
+                            if len(parts) >= 4:
+                                port, name, device_type, status = parts[:4]
+                                port = port.strip()
+                                name = name.strip()
+                                device_type = device_type.strip()
+                                status = status.strip()
+
+                                if port and port not in existing_ports:
+                                    if device_type == "Bluetooth":
+                                        display_name = f"{port} (🔵 Bluetooth - {name})"
+                                        self.port_select.addItem(
+                                            display_name, port)
+                                        bt_devices_found += 1
+                                        print(
+                                            f"[BLUETOOTH] Found paired device: {port} - {name}")
+                                    elif "OBD" in name.upper() or "ELM" in name.upper():
+                                        display_name = f"{port} (🔧 Potential OBD - {name})"
+                                        self.port_select.addItem(
+                                            display_name, port)
+                                        bt_devices_found += 1
+                                        print(
+                                            f"[BLUETOOTH] Found potential OBD: {port} - {name}")
+                        except Exception as parse_error:
+                            print(
+                                f"[BLUETOOTH] Parse error for line '{line}': {parse_error}")
+                            continue
+
+            # Additional fallback: Check for common OBD Bluetooth patterns
+            try:
+                # Look for devices with OBD-related keywords
+                obd_keywords = ["OBD", "ELM327", "ELM",
+                                "OBDII", "OBD2", "DIAGNOSTIC"]
+
                 for i in range(1, 21):
                     port_name = f"COM{i}"
-                    try:
-                        import serial as pyserial
-                        test_serial = pyserial.Serial(port_name, timeout=0.1)
-                        test_serial.close()
+                    if port_name not in existing_ports:
+                        try:
+                            import serial as pyserial
+                            # Try to open with common OBD settings
+                            test_serial = pyserial.Serial(
+                                port_name,
+                                baudrate=38400,  # Common OBD baud rate
+                                timeout=0.5,
+                                write_timeout=0.5
+                            )
 
-                        # Check if already in list
-                        existing_ports = [self.port_select.itemData(
-                            j) for j in range(self.port_select.count())]
-                        if port_name not in existing_ports:
-                            self.port_select.addItem(
-                                f"{port_name} (Detected Bluetooth)", port_name)
-                            bt_ports_found += 1
-                    except:
-                        continue
+                            # Send AT command to test if it's an OBD device
+                            test_serial.write(b'ATZ\r')  # Reset command
+                            test_serial.flush()
+                            time.sleep(0.2)
 
-                if bt_ports_found > 0:
-                    self.update_status(
-                        f"Found {bt_ports_found} potential Bluetooth ports", "success")
-                else:
-                    self.update_status(
-                        "No Bluetooth ports detected", "warning")
+                            response = test_serial.read(100)
+                            test_serial.close()
+
+                            if response and (b'ELM' in response or b'OK' in response or b'>' in response):
+                                display_name = f"{port_name} (🔧 Detected OBD Device)"
+                                self.port_select.addItem(
+                                    display_name, port_name)
+                                bt_devices_found += 1
+                                print(
+                                    f"[BLUETOOTH] Detected OBD device on {port_name}: {response}")
+                            elif len(response) > 0:  # Some response, might be Bluetooth
+                                display_name = f"{port_name} (🔵 Bluetooth Device)"
+                                self.port_select.addItem(
+                                    display_name, port_name)
+                                bt_devices_found += 1
+                                print(
+                                    f"[BLUETOOTH] Detected Bluetooth device on {port_name}")
+
+                        except Exception as test_error:
+                            # Port not available, in use, or not responsive
+                            continue
+
+            except Exception as fallback_error:
+                print(f"[BLUETOOTH] Fallback scan error: {fallback_error}")
+
+            if bt_devices_found > 0:
+                self.update_status(
+                    f"Found {bt_devices_found} Bluetooth/OBD devices", "success")
+                print(
+                    f"[BLUETOOTH] Successfully found {bt_devices_found} devices")
+            else:
+                self.update_status(
+                    "No Bluetooth OBD devices found. Check pairing and try manual entry.", "warning")
+                print("[BLUETOOTH] No devices found - check if OBD adapter is paired")
 
         except Exception as e:
-            print(f"Bluetooth scan error: {e}")
-            self.update_status("Bluetooth scan failed", "error")
+            print(f"[BLUETOOTH] Scan error: {e}")
+            self.update_status(
+                "Bluetooth scan failed. Try manual COM port entry.", "error")
 
     def refresh_ports(self):
+        """Refresh and populate the port selection with all available serial ports"""
         self.port_select.clear()
 
-        # Get standard serial ports
+        # Get standard serial ports with enhanced descriptions
         ports = serial.tools.list_ports.comports()
+        bluetooth_ports = []
+        standard_ports = []
+
         for port in ports:
             description = f"{port.device}"
-            if port.description and port.description != "n/a":
-                description += f" ({port.description})"
-            self.port_select.addItem(description, port.device)
+            port_info = ""
 
-        # Add common Bluetooth COM ports for Windows
+            # Enhanced description with device details
+            if port.description and port.description != "n/a":
+                port_info = f" ({port.description})"
+
+            # Check for Bluetooth indicators
+            is_bluetooth = any(bt_keyword in port.description.lower() if port.description else ""
+                               for bt_keyword in ["bluetooth", "bth", "bt"])
+
+            # Check for OBD indicators
+            is_obd = any(obd_keyword in port.description.lower() if port.description else ""
+                         for obd_keyword in ["elm327", "elm", "obd", "diagnostic"])
+
+            if is_bluetooth or is_obd:
+                if is_obd:
+                    display_name = f"{description} 🔧 OBD{port_info}"
+                else:
+                    display_name = f"{description} 🔵 Bluetooth{port_info}"
+                bluetooth_ports.append((display_name, port.device))
+            else:
+                display_name = f"{description}{port_info}"
+                standard_ports.append((display_name, port.device))
+
+        # Add Bluetooth ports first (higher priority)
+        for display_name, device in bluetooth_ports:
+            self.port_select.addItem(display_name, device)
+
+        # Add standard ports
+        for display_name, device in standard_ports:
+            self.port_select.addItem(display_name, device)
+
+        # Windows-specific Bluetooth port detection
         import platform
         if platform.system() == "Windows":
-            # Try to detect Bluetooth COM ports
             try:
                 import winreg
-                # Check registry for Bluetooth COM ports
+                existing_ports = [self.port_select.itemData(
+                    j) for j in range(self.port_select.count())]
+
+                # Check registry for additional Bluetooth COM ports
                 key_path = r"HARDWARE\DEVICEMAP\SERIALCOMM"
                 with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
                     i = 0
                     while True:
                         try:
                             name, value, _ = winreg.EnumValue(key, i)
-                            if "BthModem" in name or "Bluetooth" in name:
+                            if ("BthModem" in name or "Bluetooth" in name) and value not in existing_ports:
                                 self.port_select.addItem(
-                                    f"{value} (Bluetooth)", value)
+                                    f"{value} 🔵 Registry Bluetooth", value)
+                                print(
+                                    f"[PORTS] Found registry Bluetooth port: {value}")
                             i += 1
                         except WindowsError:
                             break
             except Exception as e:
-                print(f"Could not scan Bluetooth ports: {e}")
+                print(f"[PORTS] Registry scan error: {e}")
 
-            # Add common Bluetooth COM port ranges
-            for i in range(1, 21):  # COM1 to COM20
-                port_name = f"COM{i}"
-                # Only add if not already in the list
+            # Enhanced Bluetooth port probing with better detection
+            try:
                 existing_ports = [self.port_select.itemData(
                     j) for j in range(self.port_select.count())]
-                if port_name not in existing_ports:
-                    # Check if this might be a Bluetooth port by trying to open it briefly
-                    try:
-                        import serial as pyserial
-                        test_serial = pyserial.Serial(port_name, timeout=0.1)
-                        test_serial.close()
-                        self.port_select.addItem(
-                            f"{port_name} (Potential Bluetooth)", port_name)
-                    except:
-                        pass  # Port not available
 
-        # If no ports found, add manual entry option
+                for i in range(1, 21):  # COM1 to COM20
+                    port_name = f"COM{i}"
+                    if port_name not in existing_ports:
+                        try:
+                            import serial as pyserial
+                            import time
+
+                            # Try multiple common OBD/Bluetooth baud rates
+                            baud_rates = [38400, 9600, 115200]
+                            device_detected = False
+                            device_type = "Unknown"
+
+                            for baud_rate in baud_rates:
+                                if device_detected:
+                                    break
+
+                                try:
+                                    test_serial = pyserial.Serial(
+                                        port_name,
+                                        baudrate=baud_rate,
+                                        timeout=0.3,
+                                        write_timeout=0.3
+                                    )
+
+                                    # Test if it's an OBD device
+                                    test_serial.write(b'ATZ\r\n')
+                                    test_serial.flush()
+                                    time.sleep(0.2)
+
+                                    response = test_serial.read(50)
+                                    test_serial.close()
+
+                                    if response:
+                                        response_str = response.decode(
+                                            'ascii', errors='ignore').upper()
+                                        if any(obd_resp in response_str for obd_resp in ['ELM327', 'ELM', 'OK', '>']):
+                                            device_type = "OBD Device"
+                                            device_detected = True
+                                            print(
+                                                f"[PORTS] Detected OBD device on {port_name} at {baud_rate} baud: {response_str[:20]}")
+                                        # Some response indicates active device
+                                        elif len(response) > 2:
+                                            device_type = "Bluetooth Device"
+                                            device_detected = True
+                                            print(
+                                                f"[PORTS] Detected Bluetooth device on {port_name} at {baud_rate} baud")
+
+                                except Exception as test_error:
+                                    continue  # Try next baud rate
+
+                            if device_detected:
+                                if "OBD" in device_type:
+                                    display_name = f"{port_name} 🔧 Detected {device_type}"
+                                else:
+                                    display_name = f"{port_name} 🔵 Detected {device_type}"
+                                self.port_select.addItem(
+                                    display_name, port_name)
+
+                        except Exception as port_error:
+                            continue  # Port not available or permission denied
+
+            except Exception as probe_error:
+                print(f"[PORTS] Bluetooth probe error: {probe_error}")
+
+        # If no ports found, show helpful message
         if self.port_select.count() == 0:
             self.port_select.addItem(
-                "No ports detected - Try manual entry", "")
+                "⚠️ No ports detected - Try pairing Bluetooth OBD or manual entry", "")
 
         # Add manual entry option at the end
-        self.port_select.addItem("--- Manual Entry ---", "MANUAL")
+        self.port_select.addItem("✏️ Manual Entry (Type COM port)", "MANUAL")
+
+        print(
+            f"[PORTS] Refresh complete: {self.port_select.count()-1} ports found")
 
     def connect_obd(self):
+        """Enhanced OBD connection with robust Bluetooth support and retry logic"""
         # Get the selected port
         if self.port_select.currentData() == "MANUAL" or self.manual_port_input.isVisible():
             port = self.manual_port_input.text().strip()
         else:
-            port = self.port_select.currentData() or self.port_select.currentText()
+            port = self.port_select.currentData(
+            ) or self.port_select.currentText().split()[0]
 
         if not port:
             self.update_status("No port selected", "error")
@@ -1117,43 +1361,248 @@ class OBDApp(QMainWindow):
         self.connect_btn.setText("🔄 Connecting...")
         self.connect_btn.setEnabled(False)
 
-        if OBD_AVAILABLE:
-            try:
-                # For Bluetooth connections, use longer timeout
-                if "COM" in port.upper() and any(bt_indicator in self.port_select.currentText().lower()
-                                                 for bt_indicator in ["bluetooth", "bth"]):
-                    self.connection = obd.OBD(
-                        port, timeout=10, check_voltage=False)
-                else:
-                    self.connection = obd.OBD(port)
+        # Determine if this is a Bluetooth connection
+        is_bluetooth = any(bt_indicator in self.port_select.currentText().lower()
+                           for bt_indicator in ["bluetooth", "🔵", "bth"])
 
-                if self.connection.is_connected():
-                    self.connect_btn.setText("✅ Connected")
+        # Determine if this is likely an OBD device
+        is_obd_device = any(obd_indicator in self.port_select.currentText().lower()
+                            for obd_indicator in ["obd", "elm", "🔧", "diagnostic"])
+
+        print(f"[CONNECTION] Attempting to connect to {port}")
+        print(
+            f"[CONNECTION] Bluetooth: {is_bluetooth}, OBD Device: {is_obd_device}")
+
+        if OBD_AVAILABLE:
+            # Enhanced connection attempt with multiple strategies
+            connection_attempts = []
+
+            if is_bluetooth or is_obd_device:
+                # Strategy 1: Bluetooth-optimized settings
+                connection_attempts.append({
+                    'name': 'Bluetooth Optimized',
+                    'timeout': 15,
+                    'check_voltage': False,
+                    'fast': False,
+                    'protocol': None
+                })
+
+                # Strategy 2: ELM327 specific settings
+                connection_attempts.append({
+                    'name': 'ELM327 Specific',
+                    'timeout': 10,
+                    'check_voltage': False,
+                    'fast': True,
+                    'protocol': '6'  # CAN 11-bit 500kb
+                })
+
+                # Strategy 3: Basic Bluetooth settings
+                connection_attempts.append({
+                    'name': 'Basic Bluetooth',
+                    'timeout': 8,
+                    'check_voltage': False,
+                    'fast': False,
+                    'protocol': None
+                })
+            else:
+                # Strategy for standard serial connections
+                connection_attempts.append({
+                    'name': 'Standard Serial',
+                    'timeout': 5,
+                    'check_voltage': True,
+                    'fast': False,
+                    'protocol': None
+                })
+
+            # Try each connection strategy
+            for i, strategy in enumerate(connection_attempts):
+                try:
                     self.update_status(
-                        f"Connected to {port} - REAL DATA", "success")
-                    self.info_label.setText(
-                        f"Successfully connected to OBD device on {port}. Using REAL sensor data only.")
-                    self.timer.start(500)
-                else:
-                    self.connect_btn.setText("❌ Connection Failed")
-                    self.update_status("Connection failed", "error")
-                    self.info_label.setText(
-                        "Failed to establish connection. Check device, pairing, and port.")
-                    self.connect_btn.setEnabled(True)
-            except Exception as e:
-                print(f"OBD connection error: {e}")
-                self.connect_btn.setText("❌ Connection Error")
-                self.update_status("Connection error", "error")
-                self.info_label.setText(f"Connection error: {str(e)}")
-                self.connect_btn.setEnabled(True)
+                        f"Trying {strategy['name']} connection... ({i+1}/{len(connection_attempts)})", "warning")
+                    print(f"[CONNECTION] Strategy {i+1}: {strategy['name']}")
+
+                    # Pre-connection test for Bluetooth devices
+                    if is_bluetooth:
+                        if not self.test_bluetooth_port(port):
+                            print(
+                                f"[CONNECTION] Bluetooth port {port} pre-test failed")
+                            continue
+
+                    # Build connection parameters
+                    connection_params = {
+                        'portstr': port,
+                        'timeout': strategy['timeout'],
+                        'check_voltage': strategy['check_voltage'],
+                        'fast': strategy['fast']
+                    }
+
+                    if strategy['protocol']:
+                        connection_params['protocol'] = strategy['protocol']
+
+                    # Attempt connection
+                    self.connection = obd.OBD(**connection_params)
+
+                    if self.connection and self.connection.is_connected():
+                        # Connection successful
+                        self.connect_btn.setText("✅ Connected")
+                        connection_type = "Bluetooth" if is_bluetooth else "Serial"
+                        self.update_status(
+                            f"Connected to {port} via {connection_type} - REAL DATA", "success")
+
+                        # Get supported commands info
+                        supported_commands = len(
+                            self.connection.supported_commands)
+                        protocol = getattr(
+                            self.connection, 'protocol', 'Unknown')
+
+                        self.info_label.setText(
+                            f"Successfully connected to OBD device on {port} using {strategy['name']}.\n"
+                            f"Protocol: {protocol}, Supported Commands: {supported_commands}\n"
+                            f"Using REAL sensor data only."
+                        )
+
+                        print(
+                            f"[CONNECTION] Success with {strategy['name']} - Protocol: {protocol}, Commands: {supported_commands}")
+
+                        # Start data collection
+                        self.timer.start(500)
+                        self.disconnect_btn.setEnabled(True)
+                        return
+                    else:
+                        print(
+                            f"[CONNECTION] Strategy {strategy['name']} failed - not connected")
+                        if self.connection:
+                            self.connection.close()
+                            self.connection = None
+                        continue
+
+                except Exception as e:
+                    print(
+                        f"[CONNECTION] Strategy {strategy['name']} exception: {e}")
+                    if hasattr(self, 'connection') and self.connection:
+                        try:
+                            self.connection.close()
+                        except:
+                            pass
+                        self.connection = None
+                    continue
+
+            # All connection attempts failed
+            self.connect_btn.setText("❌ Connection Failed")
+            self.connect_btn.setEnabled(True)
+
+            if is_bluetooth:
+                error_msg = (
+                    f"Failed to connect to Bluetooth OBD device on {port}.\n\n"
+                    "Troubleshooting:\n"
+                    "• Ensure the OBD adapter is paired in Windows Bluetooth settings\n"
+                    "• Check that the device is plugged into your vehicle's OBD port\n"
+                    "• Turn on your vehicle's ignition (engine doesn't need to run)\n"
+                    "• Try disconnecting and reconnecting the Bluetooth adapter\n"
+                    "• Some adapters require the engine to be running"
+                )
+            else:
+                error_msg = (
+                    f"Failed to establish connection on {port}.\n"
+                    "Check device connection, port selection, and try again."
+                )
+
+            self.update_status(
+                "Connection failed - See troubleshooting tips", "error")
+            self.info_label.setText(error_msg)
         else:
-            # Demo mode
+            # Demo mode fallback
             self.connection = "DEMO"
             self.connect_btn.setText("🎮 Demo Mode")
             self.update_status("Demo Mode Active - SIMULATED DATA", "warning")
             self.info_label.setText(
                 "Running in demo mode with simulated data for testing purposes only")
             self.timer.start(500)
+
+    def disconnect_obd(self):
+        """Disconnect from OBD device and clean up connection"""
+        try:
+            # Stop the data timer first
+            if hasattr(self, 'timer') and self.timer.isActive():
+                self.timer.stop()
+
+            # Close the OBD connection
+            if hasattr(self, 'connection') and self.connection and self.connection != "DEMO":
+                try:
+                    self.connection.close()
+                    print("[DISCONNECT] OBD connection closed successfully")
+                except Exception as e:
+                    print(f"[DISCONNECT] Error closing connection: {e}")
+
+            # Reset connection state
+            self.connection = None
+
+            # Update UI
+            self.connect_btn.setText("🔌 Connect to ELM327")
+            self.connect_btn.setEnabled(True)
+            self.disconnect_btn.setEnabled(False)
+            self.update_status("Disconnected", "warning")
+            self.info_label.setText(
+                "Select a port and click connect to start monitoring")
+
+            # Clear gauge displays
+            for cmd, label in self.labels.items():
+                label.setText("---")
+
+            # Update window title
+            self.setWindowTitle("OBD-II Professional Monitor & VE Calculator")
+
+            print("[DISCONNECT] Disconnection completed successfully")
+
+        except Exception as e:
+            print(f"[DISCONNECT] Error during disconnection: {e}")
+            self.update_status("Disconnect error", "error")
+
+    def test_bluetooth_port(self, port):
+        """Test if a Bluetooth port is responsive before attempting OBD connection"""
+        try:
+            import serial as pyserial
+            import time
+
+            print(f"[BT_TEST] Testing Bluetooth port {port}")
+
+            # Try to establish basic serial communication
+            test_serial = pyserial.Serial(
+                port,
+                baudrate=38400,  # Common OBD baud rate
+                timeout=2,
+                write_timeout=2,
+                bytesize=8,
+                parity='N',
+                stopbits=1
+            )
+
+            time.sleep(0.5)  # Allow connection to stabilize
+
+            # Clear any existing data
+            test_serial.reset_input_buffer()
+            test_serial.reset_output_buffer()
+
+            # Send a basic AT command
+            test_serial.write(b'ATZ\r')
+            test_serial.flush()
+            time.sleep(1)
+
+            # Read response
+            response = test_serial.read(100)
+            test_serial.close()
+
+            if response:
+                response_str = response.decode('ascii', errors='ignore')
+                print(f"[BT_TEST] Port {port} responded: {response_str[:50]}")
+                return True
+            else:
+                print(f"[BT_TEST] Port {port} no response")
+                return False
+
+        except Exception as e:
+            print(f"[BT_TEST] Port {port} test failed: {e}")
+            return False
 
     def update_status(self, text, status_type):
         """Update connection status with appropriate styling"""
