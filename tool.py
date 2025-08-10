@@ -1,1931 +1,1374 @@
-# Diagnostic: Print all available OBD command attributes to help avoid attribute errors
-# Fix for Python 3.12 compatibility with pint library
-import collections
-import collections.abc
-try:
-    collections.MutableMapping = collections.abc.MutableMapping
-    collections.Mapping = collections.abc.Mapping
-    collections.MutableSet = collections.abc.MutableSet
-    collections.Set = collections.abc.Set
-    collections.MutableSequence = collections.abc.MutableSequence
-    collections.Sequence = collections.abc.Sequence
-    collections.Iterable = collections.abc.Iterable
-    collections.Iterator = collections.abc.Iterator
-    collections.Callable = collections.abc.Callable
-except AttributeError:
-    pass  # Already exists in older Python versions
-
-import warnings
-import time
-import random
-import numpy as np
-import pandas as pd
-import serial.tools.list_ports
 import sys
+import time
+import json
+import math
+import queue
+import threading
+import csv
+import platform
+import re
+import subprocess
+from collections import deque
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QComboBox, QTableWidget, QTableWidgetItem,
-    QFrame, QGridLayout, QGroupBox, QProgressBar, QSplitter, QLineEdit, QMessageBox
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QSpinBox,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QFileDialog,
+    QMessageBox, QHeaderView, QComboBox
 )
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont, QPalette, QColor
-from pyqtgraph import PlotWidget
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot as Slot
 import pyqtgraph as pg
+from typing import Optional, Union, Dict, List
+from obd import OBDStatus
+import serial
+import serial.tools.list_ports
 import obd
+import os
+os.environ['PYQTGRAPH_QT_LIB'] = 'PyQt5'
 
+# Bluetooth imports (platform-specific)
+try:
+    if platform.system() == "Windows":
+        import socket
+        import subprocess
+        try:
+            import bluetooth  # PyBluez  # type: ignore
+            PYBLUEZ_AVAILABLE = True
+        except ImportError:
+            PYBLUEZ_AVAILABLE = False
+    else:
+        # For Linux/macOS, we'd use different libraries
+        PYBLUEZ_AVAILABLE = False
+except ImportError:
+    PYBLUEZ_AVAILABLE = False
 
-def print_available_obd_commands():
-    print("Available OBD commands:")
-    for cmd in dir(obd.commands):
-        # Only print public attributes (skip __dunder__ and private)
-        if not cmd.startswith("_"):
-            print(cmd)
+"""
+Advanced Python OBD-II Tuning Tool (J1850 support + real-time VE table + Bluetooth RFCOMM)
 
+Features implemented in this file:
+- Support forcing ELM327 protocol to SAE J1850 PWM (1) or VPW (2) via AT SP n.
+  References for ELM327 protocol numbers and AT SP usage: ELM327 documentation and reference guides.
+  See: ELM327 protocol numbers and ATSP usage. :contentReference[oaicite:0]{index=0}
 
-# Call the diagnostic function at startup
-print_available_obd_commands()
+- Connect to ELM327-compatible adapter over serial (USB), Bluetooth RFCOMM, or TCP (WiFi ELM327).
+  For serial, optionally send "ATSPn" before python-OBD connect to force J1850 protocol.
+  
+- Bluetooth RFCOMM support for wireless OBD adapters:
+    * Automatic discovery of Bluetooth devices
+    * Smart detection of OBD-likely devices
+    * RFCOMM connection testing and establishment
+    * Cross-platform Bluetooth support (Windows optimized)
 
-# Suppress deprecation warnings from libraries
-warnings.filterwarnings('ignore', category=UserWarning)
-warnings.filterwarnings('ignore', message='pkg_resources is deprecated')
+- Real-time Volumetric Efficiency (VE) table population:
+    VE units: grams * Kelvin / kPa (g*K/kPa)
+    Formula used (per user spec):
+        g_per_cyl = (MAF_g_per_s * 120) / (RPM * cylinders)
+        VE = (g_per_cyl * Charge_Temperature_K) / MAP_kPa
+    Where:
+      - MAF_g_per_s: Mass Air Flow in grams/second (requires MAF PID)
+      - RPM: engine speed in revolutions/minute
+      - cylinders: user-configurable number of cylinders
+      - Charge_Temperature_K = IAT_C + 273.15
+      - MAP_kPa: Manifold Absolute Pressure in kilopascal (kPa)
+    The table grid (rows=MAP bins, cols=RPM bins) is updated in real time when required inputs exist.
 
-# Only use the real OBD library
-OBD_AVAILABLE = True
+- GUI: PyQt5 + pyqtgraph, includes QTableWidget that displays VE values (formatted) and highlights most-recent bin.
+- CSV Export: Export VE tables and data logs for analysis in external tools.
 
-# Modern color scheme and styling
-MODERN_STYLE = {
-    'background': '#2b2b2b',
-    'surface': '#3c3c3c',
-    'primary': '#0078d4',
-    'secondary': '#00bcf2',
-    'accent': '#00d7ff',
-    'success': '#107c10',
-    'warning': '#ff8c00',
-    'error': '#d13438',
-    'text': '#ffffff',
-    'text_secondary': '#cccccc',
-    'border': '#5a5a5a'
-}
+Requirements:
+  pip install pyserial pyqt5 pyqtgraph python-OBD pybluez (Windows)
 
-# Professional UI stylesheet
-STYLESHEET = f"""
-QMainWindow {{
-    background-color: {MODERN_STYLE['background']};
-    color: {MODERN_STYLE['text']};
-}}
-
-QTabWidget::pane {{
-    border: 1px solid {MODERN_STYLE['border']};
-    background-color: {MODERN_STYLE['surface']};
-    border-radius: 8px;
-}}
-
-QTabWidget::tab-bar {{
-    alignment: center;
-}}
-
-QTabBar::tab {{
-    background-color: {MODERN_STYLE['surface']};
-    color: {MODERN_STYLE['text_secondary']};
-    padding: 12px 24px;
-    margin: 2px;
-    border-radius: 6px;
-    min-width: 120px;
-    font-weight: 500;
-}}
-
-QTabBar::tab:selected {{
-    background-color: {MODERN_STYLE['primary']};
-    color: {MODERN_STYLE['text']};
-    font-weight: 600;
-}}
-
-QTabBar::tab:hover {{
-    background-color: {MODERN_STYLE['secondary']};
-    color: {MODERN_STYLE['text']};
-}}
-
-QPushButton {{
-    background-color: {MODERN_STYLE['primary']};
-    border: none;
-    color: {MODERN_STYLE['text']};
-    padding: 12px 24px;
-    border-radius: 6px;
-    font-weight: 600;
-    font-size: 14px;
-    min-height: 20px;
-}}
-
-QPushButton:hover {{
-    background-color: {MODERN_STYLE['secondary']};
-}}
-
-QPushButton:pressed {{
-    background-color: {MODERN_STYLE['accent']};
-}}
-
-QPushButton:disabled {{
-    background-color: {MODERN_STYLE['border']};
-    color: {MODERN_STYLE['text_secondary']};
-}}
-
-QComboBox {{
-    background-color: {MODERN_STYLE['surface']};
-    border: 2px solid {MODERN_STYLE['border']};
-    border-radius: 6px;
-    padding: 8px 12px;
-    color: {MODERN_STYLE['text']};
-    font-size: 14px;
-    min-height: 20px;
-}}
-
-QComboBox:hover {{
-    border-color: {MODERN_STYLE['primary']};
-}}
-
-QComboBox::drop-down {{
-    border: none;
-    width: 30px;
-}}
-
-QComboBox::down-arrow {{
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 5px solid {MODERN_STYLE['text']};
-    margin-right: 10px;
-}}
-
-QLabel {{
-    color: {MODERN_STYLE['text']};
-    font-size: 14px;
-    padding: 4px;
-}}
-
-QGroupBox {{
-    font-weight: 600;
-    font-size: 16px;
-    color: {MODERN_STYLE['text']};
-    border: 2px solid {MODERN_STYLE['border']};
-    border-radius: 8px;
-    margin: 10px 0;
-    padding-top: 20px;
-}}
-
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    left: 15px;
-    padding: 0 10px;
-    color: {MODERN_STYLE['primary']};
-}}
-
-QTableWidget {{
-    background-color: {MODERN_STYLE['surface']};
-    alternate-background-color: {MODERN_STYLE['background']};
-    color: {MODERN_STYLE['text']};
-    gridline-color: {MODERN_STYLE['border']};
-    border: 1px solid {MODERN_STYLE['border']};
-    border-radius: 6px;
-    font-size: 12px;
-}}
-
-QTableWidget::item {{
-    padding: 8px;
-    border: none;
-}}
-
-QTableWidget::item:selected {{
-    background-color: {MODERN_STYLE['primary']};
-}}
-
-QHeaderView::section {{
-    background-color: {MODERN_STYLE['primary']};
-    color: {MODERN_STYLE['text']};
-    padding: 8px;
-    border: none;
-    font-weight: 600;
-}}
-
-QFrame {{
-    background-color: {MODERN_STYLE['surface']};
-    border: 1px solid {MODERN_STYLE['border']};
-    border-radius: 8px;
-}}
-
-QProgressBar {{
-    border: 2px solid {MODERN_STYLE['border']};
-    border-radius: 6px;
-    text-align: center;
-    background-color: {MODERN_STYLE['surface']};
-    color: {MODERN_STYLE['text']};
-    font-weight: 600;
-}}
-
-QProgressBar::chunk {{
-    background-color: {MODERN_STYLE['success']};
-    border-radius: 4px;
-}}
+Run:
+  python tool.py
 """
 
-# OBD Parameter Definitions
-# MAP = Manifold Absolute Pressure = Intake manifold pressure measured in kPa
-# This represents the absolute pressure in the intake manifold, which is used
-# to calculate engine load and volumetric efficiency
 
-# RPM / MAP Axis setup
-# MAP = Manifold Absolute Pressure (intake manifold pressure in kPa)
-rpm_axis = np.arange(400, 8200, 400)  # Engine RPM range
-# MAP range in kPa (intake manifold pressure)
-map_axis = np.arange(15, 110, 5)
-# Volumetric Efficiency table (g*K/kPa)
-ve_table = np.full((len(map_axis), len(rpm_axis)), 0.8)
+# GUI
+
+# Plotting
+
+# OBD & serial/tcp
+
+# ----------------------------
+# Utility: force ELM327 protocol
+# ----------------------------
+
+def scan_available_ports():
+    """
+    Scan for available serial ports and return list of port info dictionaries.
+    Returns list of dicts with 'device', 'description', 'hwid' keys.
+    """
+    ports = []
+    try:
+        for port in serial.tools.list_ports.comports():
+            port_info = {
+                'device': port.device,
+                'description': port.description or 'Unknown',
+                'hwid': port.hwid or 'Unknown',
+                'type': 'serial'
+            }
+            ports.append(port_info)
+    except Exception as e:
+        print(f"Error scanning serial ports: {e}")
+    return ports
 
 
-class OBDApp(QMainWindow):
+def scan_bluetooth_devices():
+    """
+    Scan for available Bluetooth devices that might be OBD adapters.
+    Includes both discoverable and paired devices.
+    Returns list of dicts with 'device', 'description', 'hwid' keys.
+    """
+    bluetooth_devices = []
+    found_addresses = set()  # Track found devices to avoid duplicates
 
-    def setup_logging(self):
-        self.log_data = []
-        # Dynamic headers based on O2 display format
-        display_format = getattr(self, 'o2_display_combo', None)
-        current_format = display_format.currentText() if display_format else "Lambda (λ)"
+    if platform.system() == "Windows":
+        # Method 1: Try PyBluez for discoverable devices
+        if PYBLUEZ_AVAILABLE:
+            try:
+                import bluetooth  # type: ignore
+                print("Scanning for discoverable Bluetooth devices...")
+                devices = bluetooth.discover_devices(
+                    lookup_names=True, lookup_class=True, duration=8)
 
-        if "Lambda" in current_format:
-            o2_suffix = "Lambda"
-        elif "Equivalence" in current_format:
-            o2_suffix = "Phi"
-        else:
-            o2_suffix = "Voltage"
+                for addr, name, device_class in devices:
+                    if addr in found_addresses:
+                        continue
+                    found_addresses.add(addr)
 
-        self.log_headers = [
-            'Timestamp', 'RPM', 'Speed', 'Coolant Temp', 'MAP', 'IAT', 'Throttle', 'MAF', 'Timing Advance',
-            f'O2 B1S1 {o2_suffix}', f'O2 B2S1 {o2_suffix}'
+                    # Check if this might be an OBD device (be more permissive)
+                    device_name_lower = name.lower() if name else ''
+                    is_obd_likely = any(keyword in device_name_lower for keyword in
+                                        ['obd', 'elm', 'obdii', 'eobd', 'diagnostic', 'v1.5', 'v2.1'])
+
+                    device_info = {
+                        'device': f"BT:{addr}",
+                        'description': f"Bluetooth: {name or 'Unknown'}",
+                        'hwid': f"Bluetooth_{addr}",
+                        'type': 'bluetooth',
+                        'connected': False,  # Will check later
+                        'bt_address': addr,
+                        'bt_name': name or 'Unknown',
+                        'source': 'discoverable'
+                    }
+
+                    if is_obd_likely:
+                        device_info['description'] += " (OBD likely)"
+
+                    bluetooth_devices.append(device_info)
+                    print(f"Found discoverable device: {name} ({addr})")
+
+            except Exception as e:
+                print(f"PyBluez discovery error: {e}")
+
+        # Method 2: Use Windows netsh to find paired devices (more comprehensive)
+        try:
+            print("Scanning for paired Bluetooth devices...")
+            result = subprocess.run(
+                ['netsh', 'bluetooth', 'show', 'device'],
+                capture_output=True, text=True, timeout=15
+            )
+
+            if result.returncode == 0:
+                lines = result.stdout.split('\n')
+                current_device = {}
+
+                for line in lines:
+                    line = line.strip()
+                    if 'Device name:' in line:
+                        current_device['name'] = line.split(':', 1)[1].strip()
+                    elif 'Device address:' in line:
+                        current_device['address'] = line.split(':', 1)[
+                            1].strip()
+                    elif 'Device type:' in line:
+                        current_device['type'] = line.split(':', 1)[1].strip()
+                    elif 'Connected:' in line:
+                        current_device['connected'] = 'Yes' in line
+
+                        # Process device if we have complete info
+                        if 'name' in current_device and 'address' in current_device:
+                            bt_address = current_device.get('address', '')
+
+                            # Skip if already found by PyBluez
+                            if bt_address in found_addresses:
+                                current_device = {}
+                                continue
+                            found_addresses.add(bt_address)
+
+                            device_name = current_device.get(
+                                'name', '').lower()
+                            # Be more permissive with OBD detection
+                            is_obd_likely = any(keyword in device_name for keyword in
+                                                ['obd', 'elm', 'obdii', 'eobd', 'diagnostic', 'v1.5', 'v2.1', 'scanner'])
+
+                            if bt_address:
+                                device_info = {
+                                    'device': f"BT:{bt_address}",
+                                    'description': f"Bluetooth: {current_device.get('name', 'Unknown')}",
+                                    'hwid': f"Bluetooth_{bt_address}",
+                                    'type': 'bluetooth',
+                                    'connected': current_device.get('connected', False),
+                                    'bt_address': bt_address,
+                                    'bt_name': current_device.get('name', 'Unknown'),
+                                    'source': 'paired'
+                                }
+
+                                if is_obd_likely:
+                                    device_info['description'] += " (OBD likely)"
+
+                                bluetooth_devices.append(device_info)
+                                print(
+                                    f"Found paired device: {current_device.get('name')} ({bt_address}) - Connected: {current_device.get('connected', False)}")
+
+                        current_device = {}
+
+        except Exception as e:
+            print(f"Error scanning paired Bluetooth devices with netsh: {e}")
+
+        # Method 3: Try PowerShell for additional device discovery
+        try:
+            print("Scanning with PowerShell for additional Bluetooth devices...")
+            ps_result = subprocess.run([
+                'powershell', '-Command',
+                'Get-PnpDevice | Where-Object {$_.Class -eq "Bluetooth" -and $_.Status -eq "OK"} | Select-Object Name, InstanceId'
+            ], capture_output=True, text=True, timeout=10)
+
+            if ps_result.returncode == 0:
+                lines = ps_result.stdout.split('\n')
+                for line in lines[3:]:  # Skip header lines
+                    if line.strip() and not line.startswith('-'):
+                        parts = line.strip().split(None, 1)
+                        if len(parts) >= 2:
+                            name = parts[0]
+                            # Extract address if available in InstanceId
+                            if 'BTHENUM' in line:
+                                # Parse Bluetooth address from Windows device instance
+                                try:
+                                    # Look for pattern like DEV_XXXXXXXXXXXX
+                                    import re
+                                    match = re.search(
+                                        r'DEV_([0-9A-F]{12})', line, re.IGNORECASE)
+                                    if match:
+                                        addr_raw = match.group(1)
+                                        # Convert to standard MAC format
+                                        addr = ':'.join(
+                                            addr_raw[i:i+2] for i in range(0, 12, 2))
+
+                                        if addr not in found_addresses:
+                                            found_addresses.add(addr)
+                                            device_info = {
+                                                'device': f"BT:{addr}",
+                                                'description': f"Bluetooth: {name}",
+                                                'hwid': f"Bluetooth_{addr}",
+                                                'type': 'bluetooth',
+                                                'connected': True,  # PowerShell shows active devices
+                                                'bt_address': addr,
+                                                'bt_name': name,
+                                                'source': 'powershell'
+                                            }
+                                            bluetooth_devices.append(
+                                                device_info)
+                                            print(
+                                                f"Found PowerShell device: {name} ({addr})")
+                                except Exception:
+                                    pass
+
+        except Exception as e:
+            print(f"PowerShell Bluetooth scan error: {e}")
+
+    print(f"Total Bluetooth devices found: {len(bluetooth_devices)}")
+    return bluetooth_devices
+
+
+def scan_all_ports():
+    """
+    Scan for both serial and Bluetooth ports.
+    Returns combined list of all available ports.
+    """
+    all_ports = []
+
+    # Get serial ports
+    serial_ports = scan_available_ports()
+    all_ports.extend(serial_ports)
+
+    # Get Bluetooth devices
+    bluetooth_devices = scan_bluetooth_devices()
+    all_ports.extend(bluetooth_devices)
+
+    return all_ports
+
+
+def test_obd_connection(port_name, timeout=2.0):
+    """
+    Test if a port has a working OBD adapter by attempting a quick connection.
+    Supports both serial and Bluetooth RFCOMM connections.
+    Returns True if OBD adapter responds, False otherwise.
+    """
+    try:
+        # Handle Bluetooth RFCOMM connections
+        if port_name.startswith('BT:'):
+            return test_bluetooth_obd_connection(port_name, timeout)
+
+        # Handle regular serial connections
+        connection = obd.OBD(port_name, fast=True, timeout=timeout)
+        if connection and connection.status() == OBDStatus.CAR_CONNECTED:
+            connection.close()
+            return True
+        elif connection:
+            connection.close()
+        return False
+    except Exception:
+        return False
+
+
+def test_bluetooth_obd_connection(bt_device, timeout=2.0):
+    """
+    Test Bluetooth RFCOMM OBD connection.
+    bt_device format: "BT:XX:XX:XX:XX:XX:XX"
+    """
+    try:
+        if platform.system() == "Windows":
+            # Extract Bluetooth address
+            bt_address = bt_device.replace('BT:', '')
+
+            # Try PyBluez first if available
+            if PYBLUEZ_AVAILABLE:
+                try:
+                    import bluetooth  # type: ignore
+
+                    # Try to find the RFCOMM service
+                    services = bluetooth.find_service(address=bt_address)
+                    rfcomm_channel = None
+
+                    for service in services:
+                        if service.get('protocol') == 'RFCOMM':
+                            rfcomm_channel = service.get('port', 1)
+                            break
+
+                    if rfcomm_channel is None:
+                        rfcomm_channel = 1  # Default RFCOMM channel for OBD
+
+                    # Create RFCOMM socket
+                    sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+                    sock.settimeout(timeout)
+                    sock.connect((bt_address, rfcomm_channel))
+
+                    # Send basic ELM327 test command
+                    sock.send("ATZ\r")
+                    response = sock.recv(1024)
+
+                    sock.close()
+
+                    # If we get any response, consider it working
+                    return len(response) > 0
+
+                except Exception as e:
+                    print(f"PyBluez connection test failed: {e}")
+                    # Fall back to basic socket approach
+
+            # Fall back to basic socket approach
+            try:
+                import socket
+                sock = socket.socket(socket.AF_BLUETOOTH,
+                                     socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+                sock.settimeout(timeout)
+
+                # Try common RFCOMM channels (1 is most common for OBD)
+                for channel in [1, 2, 3]:
+                    try:
+                        sock.connect((bt_address, channel))
+
+                        # Send basic ELM327 test command
+                        sock.send(b"ATZ\r")
+                        response = sock.recv(1024)
+
+                        sock.close()
+
+                        # If we get any response, consider it working
+                        if response:
+                            return True
+
+                    except Exception:
+                        continue
+
+                try:
+                    sock.close()
+                except:
+                    pass
+
+            except Exception as e:
+                print(f"Socket Bluetooth test failed: {e}")
+
+        return False
+
+    except Exception as e:
+        print(f"Bluetooth test error: {e}")
+        return False
+
+
+def create_rfcomm_port_string(bt_address, channel=1):
+    """
+    Create a port string for Bluetooth RFCOMM connection.
+    This will be used with python-OBD library.
+    """
+    if platform.system() == "Windows":
+        # For Windows, we need to find the COM port assigned to the Bluetooth device
+        # or use a format that python-OBD can understand
+        return f"BT:{bt_address}:{channel}"
+    else:
+        # For Linux, RFCOMM devices appear as /dev/rfcomm*
+        return f"/dev/rfcomm{channel}"
+
+
+def force_elm327_protocol_serial(port: str, protocol_number: int, baudrate: int = 38400, timeout: float = 1.0) -> bool:
+    """
+    Open serial port, send ELM327 AT commands to set protocol, then close.
+    protocol_number: integer as per ELM327 (1 = J1850 PWM, 2 = J1850 VPW, 0 = Auto)
+    Returns True if adapter replied OK to ATSP command.
+    """
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+    except Exception as e:
+        print("Serial open error:", e)
+        return False
+
+    def send(cmd):
+        ser.write((cmd + "\r").encode('ascii'))
+        # read lines until we get a response or timeout
+        resp_lines = []
+        t0 = time.time()
+        while True:
+            if ser.in_waiting:
+                line = ser.readline().decode('ascii', errors='ignore').strip()
+                if line:
+                    resp_lines.append(line)
+                    # ELM327 usually responds with "OK" or "ERROR"
+                    if line.upper() in ("OK", "ERROR"):
+                        break
+            if time.time() - t0 > timeout:
+                break
+        return resp_lines
+
+    # reset echo off and linefeed off for clearer responses
+    send("ATE0")    # echo off
+    send("ATL0")    # linefeeds off
+    send("ATS0")    # spaces off
+    # set protocol (do not save unless user wants to; to save use ATSPn without preceding ATSP0)
+    resp = send(f"ATSP{protocol_number}")
+    ser.close()
+    # check for OK in response lines
+    return any("OK" in r.upper() for r in resp)
+
+# ----------------------------
+# Polling worker (uses python-OBD)
+# ----------------------------
+
+
+class PollWorker(threading.Thread):
+    def __init__(self, port=None, tcp_host=None, tcp_port=35000, protocol_force=None,
+                 poll_commands=None, rate_hz=10, out_q=None, stop_event=None, smooth_win=3):
+        super().__init__(daemon=True)
+        self.port = port
+        self.tcp_host = tcp_host
+        self.tcp_port = tcp_port
+        self.protocol_force = protocol_force  # integer or None
+        self.poll_commands = poll_commands or [
+            obd.commands.RPM,  # type: ignore
+            obd.commands.MAF,  # type: ignore
+            # type: ignore  # MAP (kPa on many vehicles)
+            obd.commands.INTAKE_PRESSURE,  # type: ignore
+            obd.commands.INTAKE_TEMP,      # type: ignore  # IAT in deg C
+            obd.commands.THROTTLE_POS,     # type: ignore
+            obd.commands.SPEED,            # type: ignore
+            obd.commands.COOLANT_TEMP      # type: ignore
         ]
+        self.rate_hz = max(1, rate_hz)
+        self.out_q = out_q or queue.Queue()
+        self.stop_event = stop_event or threading.Event()
+        self.smooth_win = max(1, smooth_win)
+        self.connection = None
+        self.buffers = {cmd.name: deque(maxlen=self.smooth_win)
+                        for cmd in self.poll_commands}
+        self.connected = False
 
-    def toggle_logging(self):
-        self.logging_enabled = not self.logging_enabled
-        if self.logging_enabled:
-            self.log_button.setText("Stop Logging")
+    def _connect_elm(self):
+        # If tcp_host provided, use socket-like port string for python-OBD
+        try:
+            if self.protocol_force is not None and self.port:
+                # Force protocol by sending ATSPn via serial first (ELM327)
+                ok = force_elm327_protocol_serial(
+                    self.port, self.protocol_force)
+                # proceed to python-OBD connect
+            if self.tcp_host:
+                portstr = f"socket://{self.tcp_host}:{self.tcp_port}"
+                self.connection = obd.OBD(portstr, fast=False)
+            elif self.port:
+                self.connection = obd.OBD(self.port, fast=False)
+            else:
+                self.connection = obd.OBD(fast=False)  # auto
+            self.connected = self.connection is not None and self.connection.status(
+            ) == OBDStatus.CAR_CONNECTED
+            return self.connected
+        except Exception as e:
+            print("OBD connect exception:", e)
+            self.connected = False
+            return False
+
+    def run(self):
+        # Attempt connect
+        if not self._connect_elm():
+            # try reconnect loop until stopped
+            while not self.stop_event.is_set():
+                time.sleep(1.0)
+                if self._connect_elm():
+                    break
+
+        poll_interval = 1.0 / self.rate_hz
+        last_time = time.time()
+
+        while not self.stop_event.is_set():
+            if not self.connected:
+                time.sleep(0.5)
+                continue
+
+            datapoint = {"timestamp": int(time.time()*1000)}
+            for cmd in self.poll_commands:
+                try:
+                    if self.connection is not None:
+                        resp = self.connection.query(
+                            cmd, force=True)  # type: ignore
+                    else:
+                        continue
+                    v = None
+                    if resp is not None and resp.value is not None:
+                        # safe extraction
+                        try:
+                            if hasattr(resp.value, 'magnitude'):
+                                v = float(resp.value.magnitude)
+                            else:
+                                v = float(resp.value)
+                        except Exception:
+                            v = None
+                except Exception:
+                    v = None
+
+                # smoothing & buffer
+                buf = self.buffers.setdefault(
+                    cmd.name, deque(maxlen=self.smooth_win))
+                if v is not None:
+                    buf.append(v)
+                    sm = sum(buf)/len(buf)
+                else:
+                    sm = None
+                # store with friendly key names lowercased (rpm, maf, intake_pressure->map, intake_temp->iat)
+                key = cmd.name.lower()
+                # normalize common names
+                if key == 'intake_pressure':
+                    key = 'map'
+                if key == 'intake_temp':
+                    key = 'iat'
+                if key == 'coolant_temp':
+                    key = 'clt'
+                if key == 'throttle_pos':
+                    key = 'tps'
+                if key == 'mass_air_flow':
+                    key = 'maf'
+                datapoint[key] = sm if sm is not None else 0.0  # type: ignore
+
+            # enqueue datapoint
+            self.out_q.put(datapoint)
+
+            # sleep to maintain poll rate
+            elapsed = time.time() - last_time
+            to_sleep = poll_interval - elapsed
+            if to_sleep > 0:
+                time.sleep(to_sleep)
+            last_time = time.time()
+
+        # cleanup
+        try:
+            if self.connection:
+                self.connection.close()
+        except Exception:
+            pass
+
+# ----------------------------
+# VE Table manager
+# ----------------------------
+
+
+class VETable:
+    def __init__(self, rpm_bins=None, map_bins=None, cylinders=8):
+        # rpm_bins: list of RPM centers (e.g., [400, 800, 1200, ...])
+        # map_bins: list of MAP centers in kPa (e.g., [15, 20, 25, ...])
+        self.rpm_bins = rpm_bins or list(
+            range(400, 8001, 400))  # default 400..8000 step 400
+        # default 15..105 kPa step 5
+        self.map_bins = map_bins or list(range(15, 106, 5))
+        self.cylinders = cylinders
+        # store VE values in 2D dict keyed by (map_bin, rpm_bin) -> latest VE (float)
+        self.table: Dict[int, Dict[int, Optional[float]]] = {m: {r: None for r in self.rpm_bins}
+                                                             for m in self.map_bins}
+        # additional: count or timestamp of last update for smoothing/aging
+        self.last_updated: Dict[int, Dict[int, Optional[float]]] = {m: {r: None for r in self.rpm_bins}
+                                                                    for m in self.map_bins}
+
+    @staticmethod
+    def compute_g_per_cyl_from_maf(maf_g_s: float, rpm: float, cylinders: int) -> Optional[float]:
+        """
+        Compute grams per cylinder per intake event using:
+          g_per_cyl = (MAF_g_per_s * 120) / (RPM * cylinders)
+        Derivation:
+          MAF (g/s) -> g/min = MAF*60
+          intake events per minute = (RPM/2) * cylinders
+          g per event per cylinder = (MAF*60) / (RPM/2 * cylinders) = (MAF*120)/(RPM*cylinders)
+        """
+        if maf_g_s is None or rpm is None or rpm <= 0 or cylinders <= 0:
+            return None
+        return (maf_g_s * 120.0) / (rpm * cylinders)
+
+    @staticmethod
+    def compute_ve_from_g_cyl(g_per_cyl: float, charge_temp_k: float, map_kpa: float) -> Optional[float]:
+        """
+        VE = (g_per_cyl * ChargeTemp_K) / MAP_kPa
+        Units:
+          g_per_cyl: grams
+          ChargeTemp_K: Kelvin
+          MAP_kPa: kilopascal
+        VE units: g*K/kPa
+        """
+        if g_per_cyl is None or charge_temp_k is None or map_kpa is None or map_kpa == 0:
+            return None
+        return (g_per_cyl * charge_temp_k) / map_kpa
+
+    def find_nearest_bins(self, rpm_value, map_value):
+        # choose nearest rpm bin and map bin centers
+        if rpm_value is None or map_value is None:
+            return None, None
+        # clamp and find closest
+        rpm_bin = min(self.rpm_bins, key=lambda r: abs(r - rpm_value))
+        map_bin = min(self.map_bins, key=lambda m: abs(m - map_value))
+        return rpm_bin, map_bin
+
+    def update_from_measurement(self, maf_g_s, rpm, iat_c, map_kpa, timestamp=None):
+        """
+        Compute VE from measurement and update appropriate table cell.
+        - maf_g_s: grams/sec (MAF)
+        - rpm: RPM (rev/min)
+        - iat_c: intake air temp in Celsius (converted to K)
+        - map_kpa: MAP in kPa
+        """
+        if maf_g_s is None or rpm is None or iat_c is None or map_kpa is None:
+            return None  # insufficient data
+
+        g_per_cyl = self.compute_g_per_cyl_from_maf(
+            maf_g_s, rpm, self.cylinders)
+        if g_per_cyl is None:
+            return None
+
+        charge_k = iat_c + 273.15
+        ve = self.compute_ve_from_g_cyl(g_per_cyl, charge_k, map_kpa)
+        if ve is None:
+            return None
+
+        rpm_bin, map_bin = self.find_nearest_bins(rpm, map_kpa)
+        if rpm_bin is None or map_bin is None:
+            return None
+
+        # store (optionally smooth with previous)
+        prev = self.table[map_bin][rpm_bin]
+        if prev is None:
+            new_val = ve
         else:
-            self.log_button.setText("Start Logging")
+            # simple exponential smoothing to avoid wild jumps (alpha configurable)
+            alpha = 0.4
+            new_val = prev * (1 - alpha) + ve * alpha
 
-    def export_log(self):
-        import csv
-        from PyQt5.QtWidgets import QFileDialog
-        if not self.log_data:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Log", "obd_log.csv", "CSV Files (*.csv)")
-        if not path:
-            return
-        with open(path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.log_headers)
-            writer.writerows(self.log_data)
-        from PyQt5.QtWidgets import QMessageBox
-        QMessageBox.information(self, "Export Complete",
-                                f"Log exported to {path}")
+        self.table[map_bin][rpm_bin] = new_val
+        self.last_updated[map_bin][rpm_bin] = timestamp or time.time()
+        return (rpm_bin, map_bin, new_val)
 
+# ----------------------------
+# Main GUI application (PySide6)
+# ----------------------------
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OBD-II Professional Monitor & VE Calculator")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setWindowTitle("OBD-II Advanced VE Tuner (J1850 compatible)")
+        self.resize(1300, 900)
 
-        # Ensure logging_enabled is always set before any method uses it
-        self.logging_enabled = False
-        self.log_data = []
-        self.log_headers = [
-            'Timestamp', 'RPM', 'Speed', 'Coolant Temp', 'MAP', 'IAT', 'Throttle', 'MAF', 'Timing Advance', 'O2 B1S1', 'O2 B2S1'
-        ]
+        # Queue for worker -> GUI
+        self.poll_q = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker = None
 
-        # Apply modern styling
-        self.setStyleSheet(STYLESHEET)
+        # Data logging for CSV export
+        self.data_log = []  # Store all datapoints for CSV export
+        self.max_log_entries = 10000  # Limit to prevent memory issues
 
-        # Set modern font
-        font = QFont("Segoe UI", 10)
-        self.setFont(font)
+        # VE table: default bins as previously described
+        rpm_bins = list(range(400, 8001, 400))   # 400..8000 step 400
+        map_bins = list(range(15, 106, 5))       # 15..105 kPa step 5
+        self.ve_table = VETable(
+            rpm_bins=rpm_bins, map_bins=map_bins, cylinders=8)
 
-        # Create main widget and layout
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+        # GUI layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        vbox = QVBoxLayout(central)
 
-        # Add title header
-        self.create_header(main_layout)
-
-        # Create tabs with modern styling
-        self.tabs = QTabWidget()
-        self.tabs.setTabPosition(QTabWidget.North)
-        main_layout.addWidget(self.tabs)
-
-        self.connection = None
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_pids)
-
-        self.build_connection_tab()
-        self.build_gauge_tab()
-        self.build_ve_tab()
-        self.build_visual_tab()
-
-    def create_header(self, layout):
-        """Create a professional header with title and status, always sized and centered correctly"""
-        header_frame = QFrame()
-        header_frame.setMinimumHeight(90)
-        header_frame.setMaximumHeight(160)
-        header_frame.setStyleSheet(f"""
-            QFrame {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1a365d, 
-                    stop:0.5 {MODERN_STYLE['primary']},
-                    stop:1 #2a69ac);
-                border-radius: 12px;
-                margin-bottom: 10px;
-                border: 2px solid rgba(255, 255, 255, 0.1);
-            }}
-        """)
-
-        header_layout = QVBoxLayout(header_frame)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(0)
-
-        # Title
-        title_label = QLabel("OBD-II Professional Monitor")
-        title_label.setWordWrap(True)
-        title_label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        title_label.setStyleSheet("""
-            QLabel {
-                color: #ffffff;
-                font-size: 2.2em;
-                font-weight: 700;
-                background: transparent;
-                border: none;
-                padding-top: 18px;
-                padding-bottom: 2px;
-            }
-        """)
-
-        # Subtitle
-        subtitle_label = QLabel(
-            "Real-time engine diagnostics & volumetric efficiency analysis")
-        subtitle_label.setWordWrap(True)
-        subtitle_label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        subtitle_label.setStyleSheet("""
-            QLabel {
-                color: #e0e6ed;
-                font-size: 1.1em;
-                font-weight: 400;
-                background: transparent;
-                border: none;
-                padding-bottom: 12px;
-            }
-        """)
-
-        header_layout.addWidget(title_label, stretch=2)
-        header_layout.addWidget(subtitle_label, stretch=1)
-
-        layout.addWidget(header_frame)
-
-    def build_connection_tab(self):
-        self.conn_tab = QWidget()
-        main_layout = QVBoxLayout(self.conn_tab)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
-
-        # Connection Group
-        connection_group = QGroupBox("OBD Device Connection")
-        connection_layout = QVBoxLayout(connection_group)
-        connection_layout.setSpacing(15)
+        # Connection controls row
+        h_conn = QHBoxLayout()
 
         # Port selection
-        port_container = QWidget()
-        port_layout = QHBoxLayout(port_container)
-        port_layout.setContentsMargins(0, 0, 0, 0)
+        port_layout = QVBoxLayout()
+        port_row = QHBoxLayout()
+        self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(200)
+        self.refresh_ports_btn = QPushButton("🔄 Scan Ports")
+        self.refresh_ports_btn.setMaximumWidth(120)
+        self.test_connection_btn = QPushButton("🔧 Test OBD")
+        self.test_connection_btn.setMaximumWidth(100)
+        port_row.addWidget(QLabel("Port:"))
+        port_row.addWidget(self.port_combo)
+        port_row.addWidget(self.refresh_ports_btn)
+        port_row.addWidget(self.test_connection_btn)
+        port_layout.addLayout(port_row)
 
-        port_label = QLabel("Select Port:")
-        port_label.setStyleSheet("font-weight: 600; color: #cccccc;")
-        port_layout.addWidget(port_label)
+        # Manual port input (fallback)
+        manual_row = QHBoxLayout()
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText(
+            "Manual port (e.g., COM3 or BT:XX:XX:XX:XX:XX:XX)")
+        manual_row.addWidget(QLabel("Manual:"))
+        manual_row.addWidget(self.port_input)
+        port_layout.addLayout(manual_row)
 
-        self.port_select = QComboBox()
-        self.port_select.setMinimumWidth(200)
-        self.port_select.setEditable(True)  # Allow manual entry
-        self.refresh_ports()
-        port_layout.addWidget(self.port_select)
-        port_layout.addStretch()
+        h_conn.addLayout(port_layout)
 
-        # Manual port entry
-        self.manual_port_input = QLineEdit()
-        self.manual_port_input.setPlaceholderText(
-            "Enter port manually (e.g., COM4)")
-        self.manual_port_input.setVisible(False)
-        port_layout.addWidget(self.manual_port_input)
+        # Other connection settings
+        self.protocol_combo = QComboBox()
+        self.protocol_combo.addItems(
+            ["Auto(0)", "J1850 PWM(1)", "J1850 VPW(2)", "ISO 9141-2(3)", "KWP(4)", "CAN(6)"])
+        # default to J1850 VPW (GM) common for older GM
+        self.protocol_combo.setCurrentIndex(2)
+        self.tcp_input = QLineEdit()
+        self.tcp_input.setPlaceholderText(
+            "TCP host (optional, e.g., 192.168.0.10)")
+        self.poll_hz_spin = QSpinBox()
+        self.poll_hz_spin.setRange(1, 50)
+        self.poll_hz_spin.setValue(10)
+        self.smooth_spin = QSpinBox()
+        self.smooth_spin.setRange(1, 20)
+        self.smooth_spin.setValue(3)
+        self.cyl_spin = QSpinBox()
+        self.cyl_spin.setRange(1, 16)
+        self.cyl_spin.setValue(self.ve_table.cylinders)
 
-        # Refresh button
-        refresh_btn = QPushButton("🔄 Refresh Ports")
-        refresh_btn.clicked.connect(self.refresh_ports)
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {MODERN_STYLE['surface']};
-                border: 2px solid {MODERN_STYLE['border']};
-                color: {MODERN_STYLE['text']};
-            }}
-            QPushButton:hover {{
-                border-color: {MODERN_STYLE['primary']};
-                background-color: {MODERN_STYLE['primary']};
-            }}
-        """)
-        port_layout.addWidget(refresh_btn)
-
-        # Bluetooth scan button
-        bt_scan_btn = QPushButton("🔵 Scan Bluetooth")
-        bt_scan_btn.clicked.connect(self.scan_bluetooth)
-        bt_scan_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {MODERN_STYLE['secondary']};
-                border: 2px solid {MODERN_STYLE['border']};
-                color: {MODERN_STYLE['text']};
-            }}
-            QPushButton:hover {{
-                border-color: {MODERN_STYLE['accent']};
-                background-color: {MODERN_STYLE['accent']};
-            }}
-        """)
-        port_layout.addWidget(bt_scan_btn)
-
-        # Connect port selection change to show/hide manual input
-        self.port_select.currentTextChanged.connect(
-            self.on_port_selection_changed)
-
-        connection_layout.addWidget(port_container)
-
-        # Connection button and status
-        button_container = QWidget()
-        button_layout = QHBoxLayout(button_container)
-        button_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.connect_btn = QPushButton("🔌 Connect to ELM327")
-        self.connect_btn.setMinimumHeight(50)
-        self.connect_btn.clicked.connect(self.connect_obd)
-        button_layout.addWidget(self.connect_btn)
-
-        # Add disconnect button
-        self.disconnect_btn = QPushButton("🔌 Disconnect")
-        self.disconnect_btn.setMinimumHeight(50)
+        self.connect_btn = QPushButton("Connect & Start")
+        self.disconnect_btn = QPushButton("Stop")
         self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.clicked.connect(self.disconnect_obd)
-        self.disconnect_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {MODERN_STYLE['error']};
-                color: {MODERN_STYLE['text']};
-            }}
-            QPushButton:hover {{
-                background-color: #ff4757;
-            }}
-            QPushButton:disabled {{
-                background-color: {MODERN_STYLE['border']};
-                color: {MODERN_STYLE['text_secondary']};
-            }}
-        """)
-        button_layout.addWidget(self.disconnect_btn)
 
-        connection_layout.addWidget(button_container)
+        h_conn.addWidget(QLabel("TCP:"))
+        h_conn.addWidget(self.tcp_input)
+        h_conn.addWidget(QLabel("Protocol:"))
+        h_conn.addWidget(self.protocol_combo)
+        h_conn.addWidget(QLabel("Poll Hz:"))
+        h_conn.addWidget(self.poll_hz_spin)
+        h_conn.addWidget(QLabel("Smoothing:"))
+        h_conn.addWidget(self.smooth_spin)
+        h_conn.addWidget(QLabel("Cylinders:"))
+        h_conn.addWidget(self.cyl_spin)
+        h_conn.addWidget(self.connect_btn)
+        h_conn.addWidget(self.disconnect_btn)
+        vbox.addLayout(h_conn)
 
-        # Status section
-        status_group = QGroupBox("Connection Status")
-        status_layout = QVBoxLayout(status_group)
+        # Top plots and live readouts
+        top_h = QHBoxLayout()
+        # plots
+        plot_layout = QVBoxLayout()
+        self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setBackground('w')
+        self.rpm_plot = self.plot_widget.addPlot(title="RPM")
+        self.rpm_curve = self.rpm_plot.plot(pen='r')
+        self.plot_widget.nextRow()
+        self.afr_plot = self.plot_widget.addPlot(title="MAF(g/s) and MAP(kPa)")
+        self.maf_curve = self.afr_plot.plot(pen='g')
+        self.map_curve = self.afr_plot.plot(pen='b')
+        plot_layout.addWidget(self.plot_widget)
+        top_h.addLayout(plot_layout, 3)
 
-        self.status_label = QLabel("Not Connected")
-        self.status_label.setStyleSheet(f"""
-            QLabel {{
-                color: {MODERN_STYLE['error']};
-                font-size: 16px;
-                font-weight: 600;
-                padding: 10px;
-                background-color: rgba(209, 52, 56, 0.1);
-                border: 1px solid {MODERN_STYLE['error']};
-                border-radius: 6px;
-            }}
-        """)
-        status_layout.addWidget(self.status_label)
+        # live labels
+        live_layout = QVBoxLayout()
+        self.rpm_label = QLabel("RPM: —")
+        self.maf_label = QLabel("MAF (g/s): —")
+        self.map_label = QLabel("MAP (kPa): —")
+        self.iat_label = QLabel("IAT (°C): —")
+        for w in (self.rpm_label, self.maf_label, self.map_label, self.iat_label):
+            w.setStyleSheet(
+                "font-size:16px; padding:6px; background:#fff; border:1px solid #ddd;")
+            live_layout.addWidget(w)
+        top_h.addLayout(live_layout, 1)
 
-        # Connection info
-        self.info_label = QLabel(
-            "Select a port and click connect to start monitoring")
-        self.info_label.setStyleSheet(
-            "color: #cccccc; font-style: italic; padding: 10px;")
-        status_layout.addWidget(self.info_label)
+        vbox.addLayout(top_h)
 
-        # Bluetooth instructions
-        bt_info_group = QGroupBox("Bluetooth Connection Help")
-        bt_info_layout = QVBoxLayout(bt_info_group)
+        # VE table grid and controls
+        mid_h = QHBoxLayout()
+        # VE QTableWidget
+        self.ve_table_widget = QTableWidget()
+        self._init_ve_table_widget()
+        mid_h.addWidget(self.ve_table_widget, 3)
 
-        bt_instructions = QLabel("""
-<b>📱 Bluetooth OBD Connection Guide:</b><br/>
-<b>1. Pairing (First Time):</b><br/>
-   • Go to Windows Settings → Devices → Bluetooth<br/>
-   • Make sure Bluetooth is ON<br/>
-   • Put your OBD adapter in pairing mode (usually automatic)<br/>
-   • Click "Add Bluetooth or other device" → Bluetooth<br/>
-   • Select your OBD device (usually ELM327, OBD2, etc.)<br/>
-   • Enter PIN: 1234 or 0000 (most common)<br/><br/>
+        # controls for VE table
+        ctrl_layout = QVBoxLayout()
+        self.save_btn = QPushButton("Save VE Table (JSON)")
+        self.load_btn = QPushButton("Load VE Table (JSON)")
+        self.clear_btn = QPushButton("Clear VE Table")
 
-<b>2. Before Connecting:</b><br/>
-   • Plug OBD adapter into your vehicle's diagnostic port<br/>
-   • Turn vehicle ignition to ON position (engine can be off)<br/>
-   • Wait 10-15 seconds for adapter to initialize<br/>
-   • Some adapters require engine to be running<br/><br/>
+        # CSV Export buttons
+        self.export_ve_csv_btn = QPushButton("Export VE Table (CSV)")
+        self.export_data_csv_btn = QPushButton("Export Data Log (CSV)")
+        self.clear_log_btn = QPushButton("Clear Data Log")
 
-<b>3. Troubleshooting:</b><br/>
-   • Use "Scan Bluetooth" to find paired devices automatically<br/>
-   • Check Windows Device Manager for COM port assignment<br/>
-   • Try "Refresh Ports" if device doesn't appear<br/>
-   • Connection may take 10-15 seconds for Bluetooth<br/>
-   • If connection fails, try turning Bluetooth off/on in Windows
-        """)
-        bt_instructions.setWordWrap(True)
-        bt_instructions.setStyleSheet("""
-            QLabel {
-                color: #cccccc;
-                background-color: rgba(120, 120, 120, 0.1);
-                border-radius: 6px;
-                padding: 15px;
-                margin: 5px;
-                line-height: 1.4;
-            }
-        """)
-        bt_info_layout.addWidget(bt_instructions)
+        ctrl_layout.addWidget(self.save_btn)
+        ctrl_layout.addWidget(self.load_btn)
+        ctrl_layout.addWidget(self.clear_btn)
+        ctrl_layout.addWidget(QLabel(""))  # Spacer
+        ctrl_layout.addWidget(self.export_ve_csv_btn)
+        ctrl_layout.addWidget(self.export_data_csv_btn)
+        ctrl_layout.addWidget(self.clear_log_btn)
+        ctrl_layout.addStretch()
+        mid_h.addLayout(ctrl_layout, 1)
 
-        main_layout.addWidget(connection_group)
-        main_layout.addWidget(status_group)
-        main_layout.addWidget(bt_info_group)
-        main_layout.addStretch()
+        vbox.addLayout(mid_h)
 
-        self.tabs.addTab(self.conn_tab, "🔌 Connection")
+        # bottom: status log & connection info
+        bottom_h = QHBoxLayout()
+        self.log_label = QLabel("Status: Idle")
+        self.connection_status_label = QLabel("Connection: Not connected")
+        self.connection_status_label.setStyleSheet("color: red;")
+        self.data_log_status_label = QLabel("Data Log: 0 entries")
+        self.data_log_status_label.setStyleSheet("color: blue;")
+        bottom_h.addWidget(self.log_label)
+        bottom_h.addWidget(self.connection_status_label)
+        bottom_h.addWidget(self.data_log_status_label)
+        vbox.addLayout(bottom_h)
 
-    def build_gauge_tab(self):
-        self.gauge_tab = QWidget()
-        self.gauge_tab.setMinimumSize(1200, 600)
-        main_layout = QVBoxLayout(self.gauge_tab)
-        main_layout.setContentsMargins(40, 40, 40, 40)
+        # internal buffers for plotting
+        self.max_points = 500
+        self.buffers = {'rpm': deque(maxlen=self.max_points), 'maf': deque(
+            maxlen=self.max_points), 'map': deque(maxlen=self.max_points)}
 
-        # Simple grid for digital values
-        grid_layout = QGridLayout()
-        grid_layout.setSpacing(18)
-        grid_layout.setContentsMargins(0, 0, 0, 0)
+        # timers and signals
+        self.gui_timer = QTimer()
+        self.gui_timer.setInterval(100)  # 10 Hz refresh
+        self.gui_timer.timeout.connect(self._on_gui_timer)
+        self.gui_timer.start()
 
-        self.labels = {}
-        pid_list = [
-            ("RPM", obd.commands.RPM, "#ff6b6b"),
-            ("Speed", obd.commands.SPEED, "#4ecdc4"),
-            ("Coolant Temp", obd.commands.COOLANT_TEMP, "#45b7d1"),
-            ("MAP (Intake Manifold Pressure)",
-             obd.commands.INTAKE_PRESSURE, "#96ceb4"),
-            ("IAT", obd.commands.INTAKE_TEMP, "#feca57"),
-            ("Throttle", obd.commands.THROTTLE_POS, "#ff9ff3"),
-            ("MAF", obd.commands.MAF, "#54a0ff"),
-            ("Timing Advance", obd.commands.TIMING_ADVANCE, "#5f27cd"),
-            ("O2 B1S1", obd.commands.O2_B1S1, "#f7b731"),
-            ("O2 B2S1", obd.commands.O2_B2S1, "#8854d0"),
-        ]
-        self.pid_list = pid_list
+        # connect signals
+        self.connect_btn.clicked.connect(self._on_connect)
+        self.disconnect_btn.clicked.connect(self._on_disconnect)
+        self.refresh_ports_btn.clicked.connect(self._on_refresh_ports)
+        self.test_connection_btn.clicked.connect(self._on_test_connection)
+        self.save_btn.clicked.connect(self._on_save_ve)
+        self.load_btn.clicked.connect(self._on_load_ve)
+        self.clear_btn.clicked.connect(self._on_clear_ve)
+        self.export_ve_csv_btn.clicked.connect(self._on_export_ve_csv)
+        self.export_data_csv_btn.clicked.connect(self._on_export_data_csv)
+        self.clear_log_btn.clicked.connect(self._on_clear_data_log)
+        self.cyl_spin.valueChanged.connect(self._on_cylinder_change)
 
-        font_label = QFont("Segoe UI", 22, QFont.Bold)
-        font_value = QFont("Consolas", 38, QFont.Bold)
+        # Initialize port list
+        self._on_refresh_ports()
 
-        for i, (label, cmd, color) in enumerate(pid_list):
-            row = i // 3
-            col = (i % 3) * 2
-            label_widget = QLabel(label)
-            label_widget.setFont(font_label)
-            label_widget.setStyleSheet(f"color: #cccccc; padding-right: 18px;")
-            value_widget = QLabel("---")
-            value_widget.setFont(font_value)
-            value_widget.setStyleSheet(f"color: {color}; padding-left: 8px;")
-            value_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self.labels[cmd] = value_widget
-            grid_layout.addWidget(label_widget, row, col,
-                                  alignment=Qt.AlignRight)
-            grid_layout.addWidget(value_widget, row, col +
-                                  1, alignment=Qt.AlignLeft)
-
-        main_layout.addLayout(grid_layout)
-
-        # Add O2 sensor display selection
-        o2_control_row = QHBoxLayout()
-        o2_label = QLabel("O2 Sensor Display:")
-        o2_label.setStyleSheet(
-            "font-weight: 600; color: #cccccc; font-size: 14px;")
-        o2_control_row.addWidget(o2_label)
-
-        self.o2_display_combo = QComboBox()
-        self.o2_display_combo.addItems(
-            ["Lambda (λ)", "Equivalence Ratio (φ)", "Voltage (V)"])
-        self.o2_display_combo.setCurrentText("Lambda (λ)")
-        self.o2_display_combo.setMinimumWidth(200)
-        self.o2_display_combo.currentTextChanged.connect(
-            self.on_o2_display_changed)
-        o2_control_row.addWidget(self.o2_display_combo)
-        o2_control_row.addStretch()
-        main_layout.addLayout(o2_control_row)
-
-        # Add Start/Stop Logging and Export Log buttons at the bottom of the gauge tab
-        btn_row = QHBoxLayout()
-        self.log_button = QPushButton("Start Logging")
-        self.log_button.setMinimumHeight(40)
-        self.log_button.clicked.connect(self.toggle_logging)
-        btn_row.addWidget(self.log_button)
-        export_btn = QPushButton("Export Log to CSV")
-        export_btn.setMinimumHeight(40)
-        export_btn.clicked.connect(self.export_log)
-        btn_row.addWidget(export_btn)
-        main_layout.addLayout(btn_row)
-        main_layout.addStretch()
-        self.tabs.addTab(self.gauge_tab, "📊 Real-Time Gauges")
-
-    def open_customize_dashboard(self):
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QCheckBox, QComboBox, QLabel, QPushButton, QGroupBox, QFormLayout
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Customize Dashboard")
-        dialog.setMinimumWidth(600)
-        layout = QVBoxLayout(dialog)
-        # ...existing code...
-
-        # Gauge size selection
-        size_group = QGroupBox("Gauge Card Size")
-        size_layout = QHBoxLayout(size_group)
-        size_combo = QComboBox()
-        size_combo.addItems(["Small", "Medium", "Large"])
-        size_combo.setCurrentText(self.gauge_card_size)
-        size_layout.addWidget(QLabel("Size:"))
-        size_layout.addWidget(size_combo)
-        layout.addWidget(size_group)
-
-        # Gauge visibility and type
-        vis_group = QGroupBox("Gauges")
-        vis_layout = QFormLayout(vis_group)
-        checkboxes = {}
-        type_combos = {}
-        for label, cmd, icon, color in self.pid_list:
-            cb = QCheckBox(f"{icon} {label}")
-            cb.setChecked(self.gauge_card_visible[cmd])
-            checkboxes[cmd] = cb
-            type_combo = QComboBox()
-            type_combo.addItems(["Numeric", "Progress Bar"])
-            type_combo.setCurrentText(self.gauge_card_type.get(cmd, "Numeric"))
-            type_combos[cmd] = type_combo
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.addWidget(cb)
-            row_layout.addWidget(QLabel("Type:"))
-            row_layout.addWidget(type_combo)
-            vis_layout.addRow(row_widget)
-        layout.addWidget(vis_group)
-
-        # Save and Cancel buttons
-        btn_layout = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        cancel_btn = QPushButton("Cancel")
-        btn_layout.addWidget(save_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-
-        def save_customization():
-            self.gauge_card_size = size_combo.currentText()
-            for cmd in checkboxes:
-                self.gauge_card_visible[cmd] = checkboxes[cmd].isChecked()
-                self.gauge_card_type[cmd] = type_combos[cmd].currentText()
-            self.refresh_gauge_cards()
-            dialog.accept()
-
-        save_btn.clicked.connect(save_customization)
-        cancel_btn.clicked.connect(dialog.reject)
-        dialog.exec_()
-
-    def refresh_gauge_cards(self):
-        # Remove all widgets from grid
-        for i in reversed(range(self.gauge_grid_layout.count())):
-            widget = self.gauge_grid_layout.itemAt(i).widget()
-            if widget:
-                self.gauge_grid_layout.removeWidget(widget)
-                widget.setParent(None)
-        # Determine card size
-        size_map = {
-            'Small': (220, 90, 18, 28),
-            'Medium': (300, 130, 28, 38),
-            'Large': (400, 180, 38, 48)
-        }
-        w, h, icon_size, value_size = size_map.get(
-            self.gauge_card_size, (400, 180, 38, 48))
-        # Recreate cards
-        self.labels.clear()
-        self.gauge_cards.clear()
-        visible_pids = [(label, cmd, icon, color) for (
-            label, cmd, icon, color) in self.pid_list if self.gauge_card_visible[cmd]]
-        for i, (label, cmd, icon, color) in enumerate(visible_pids):
-            card = self.create_gauge_card(
-                label, cmd, icon, color, w, h, icon_size, value_size, self.gauge_card_type[cmd])
-            row, col = divmod(i, 3)
-            self.gauge_grid_layout.addWidget(card, row, col)
-        self.gauge_main_layout.update()
-
-    # No longer needed: create_gauge_card
-
-    def build_ve_tab(self):
-        self.ve_tab = QWidget()
-        main_layout = QVBoxLayout(self.ve_tab)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
-
-        # VE Table Group
-        ve_group = QGroupBox("Volumetric Efficiency Table (g/cyl)")
-        ve_layout = QVBoxLayout(ve_group)
-
-        # Table description
-        desc_label = QLabel(
-            "Real-time calculated air mass per cylinder based on MAP, RPM, and IAT")
-        desc_label.setStyleSheet(f"""
-            QLabel {{
-                color: {MODERN_STYLE['text_secondary']};
-                font-style: italic;
-                padding: 10px;
-                background-color: rgba(120, 120, 120, 0.1);
-                border-radius: 6px;
-                margin-bottom: 10px;
-            }}
-        """)
-        ve_layout.addWidget(desc_label)
-
-        # Create modern table
-        self.ve_table_widget = QTableWidget(len(map_axis), len(rpm_axis))
+    def _init_ve_table_widget(self):
+        rpm_bins = self.ve_table.rpm_bins
+        map_bins = self.ve_table.map_bins
+        # columns = RPM bins, rows = MAP bins
+        self.ve_table_widget.setColumnCount(len(rpm_bins))
+        self.ve_table_widget.setRowCount(len(map_bins))
         self.ve_table_widget.setHorizontalHeaderLabels(
-            [f"{int(r)}" for r in rpm_axis])
+            [str(r) for r in rpm_bins])
         self.ve_table_widget.setVerticalHeaderLabels(
-            [f"{int(m)}" for m in map_axis])
+            [str(m) for m in map_bins])
+        self.ve_table_widget.horizontalHeader().setSectionResizeMode(  # type: ignore
+            QHeaderView.Stretch)
+        self.ve_table_widget.verticalHeader().setSectionResizeMode(  # type: ignore
+            QHeaderView.Stretch)
+        # initialize with empty items
+        for r_idx, m in enumerate(map_bins):
+            for c_idx, r in enumerate(rpm_bins):
+                item = QTableWidgetItem("")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.ve_table_widget.setItem(r_idx, c_idx, item)
 
-        # Style the table headers
-        self.ve_table_widget.horizontalHeader().setStyleSheet(f"""
-            QHeaderView::section {{
-                background-color: {MODERN_STYLE['primary']};
-                color: white;
-                padding: 8px;
-                border: 1px solid {MODERN_STYLE['border']};
-                font-weight: 600;
-                font-size: 12px;
-            }}
-        """)
+    @Slot()
+    def _on_refresh_ports(self):
+        """Scan for available serial and Bluetooth ports and populate the combo box."""
+        self.port_combo.clear()
+        self.port_combo.addItem("Auto-detect", "")
 
-        self.ve_table_widget.verticalHeader().setStyleSheet(f"""
-            QHeaderView::section {{
-                background-color: {MODERN_STYLE['secondary']};
-                color: white;
-                padding: 8px;
-                border: 1px solid {MODERN_STYLE['border']};
-                font-weight: 600;
-                font-size: 12px;
-            }}
-        """)
+        try:
+            # Get both serial and Bluetooth ports
+            ports = scan_all_ports()
+            if not ports:
+                self.port_combo.addItem("No ports found", "")
+                self._append_log("No serial or Bluetooth ports found")
+                return
 
-        # Set table properties
-        self.ve_table_widget.setAlternatingRowColors(True)
-        self.ve_table_widget.setSelectionBehavior(QTableWidget.SelectItems)
+            # Categorize ports
+            serial_obd_ports = []
+            bluetooth_obd_ports = []
+            other_serial_ports = []
+            other_bluetooth_ports = []
 
-        # Initialize table with placeholder values
-        self.initialize_ve_table()
+            for port_info in ports:
+                device = port_info['device']
+                description = port_info['description']
+                port_type = port_info.get('type', 'unknown')
 
-        ve_layout.addWidget(self.ve_table_widget)
+                # Check if this looks like an OBD adapter
+                desc_lower = description.lower()
+                is_obd_likely = any(keyword in desc_lower for keyword in
+                                    ['elm327', 'obd', 'obdii', 'usb-serial', 'ch340', 'cp210', 'ftdi']) or \
+                    'obd likely' in desc_lower
 
-        # Add control buttons for the VE table
-        ve_controls = QHBoxLayout()
+                display_text = f"{device} - {description}"
 
-        clear_table_btn = QPushButton("Clear VE Table")
-        clear_table_btn.clicked.connect(self.clear_ve_table)
-        clear_table_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {MODERN_STYLE['warning']};
-                color: {MODERN_STYLE['text']};
-                font-size: 12px;
-                padding: 8px 16px;
-            }}
-            QPushButton:hover {{
-                background-color: {MODERN_STYLE['error']};
-            }}
-        """)
-        ve_controls.addWidget(clear_table_btn)
+                # Add connection status for Bluetooth devices
+                if port_type == 'bluetooth':
+                    connected_status = " (Connected)" if port_info.get(
+                        'connected', False) else " (Not Connected)"
 
-        export_ve_btn = QPushButton("Export VE Table")
-        export_ve_btn.clicked.connect(self.export_ve_table)
-        export_ve_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {MODERN_STYLE['secondary']};
-                color: {MODERN_STYLE['text']};
-                font-size: 12px;
-                padding: 8px 16px;
-            }}
-        """)
-        ve_controls.addWidget(export_ve_btn)
+                    # Add source info for debugging/transparency
+                    source = port_info.get('source', 'unknown')
+                    source_map = {
+                        'discoverable': 'Disc',
+                        'paired': 'Paired',
+                        'powershell': 'PS'
+                    }
+                    source_text = source_map.get(source, source)
+                    display_text += f"{connected_status} [{source_text}]"
 
-        ve_controls.addStretch()
-        ve_layout.addLayout(ve_controls)
-        main_layout.addWidget(ve_group)
+                # Categorize by type and OBD likelihood
+                if port_type == 'bluetooth':
+                    if is_obd_likely:
+                        bluetooth_obd_ports.append((display_text, device))
+                    else:
+                        other_bluetooth_ports.append((display_text, device))
+                else:  # serial
+                    if is_obd_likely:
+                        display_text += " (OBD likely)"
+                        serial_obd_ports.append((display_text, device))
+                    else:
+                        other_serial_ports.append((display_text, device))
 
-        self.tabs.addTab(self.ve_tab, "📋 VE Table")
+            # Add ports in priority order: BT OBD, Serial OBD, Other BT, Other Serial
+            all_categorized = [
+                ("🔵 Bluetooth OBD Devices:", bluetooth_obd_ports),
+                ("🔌 Serial OBD Devices:", serial_obd_ports),
+                ("🔵 Other Bluetooth:", other_bluetooth_ports),
+                ("🔌 Other Serial:", other_serial_ports)
+            ]
 
-    def initialize_ve_table(self):
-        """Initialize the VE table with placeholder values"""
-        for m_idx in range(len(map_axis)):
-            for r_idx in range(len(rpm_axis)):
-                item = QTableWidgetItem("---")
-                item.setTextAlignment(Qt.AlignCenter)
-                # Dark gray for uninitialized
-                item.setBackground(QColor(60, 60, 60, 50))
-                self.ve_table_widget.setItem(m_idx, r_idx, item)
+            for category_name, category_ports in all_categorized:
+                if category_ports:
+                    # Add category separator (disabled item)
+                    self.port_combo.addItem(f"--- {category_name} ---", "")
 
-    def clear_ve_table(self):
-        """Clear all VE table data"""
-        reply = QMessageBox.question(self, 'Clear VE Table',
-                                     'Are you sure you want to clear all VE table data?',
-                                     QMessageBox.Yes | QMessageBox.No,
-                                     QMessageBox.No)
+                    for display_text, device in category_ports:
+                        self.port_combo.addItem(display_text, device)
 
-        if reply == QMessageBox.Yes:
-            self.initialize_ve_table()
-            print("[VE TABLE] Table cleared")
+            serial_count = len([p for p in ports if p.get('type') == 'serial'])
+            bluetooth_count = len(
+                [p for p in ports if p.get('type') == 'bluetooth'])
+            self._append_log(
+                f"Found {serial_count} serial ports, {bluetooth_count} Bluetooth devices")
 
-    def export_ve_table(self):
-        """Export VE table data to CSV"""
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox
-        import csv
+        except Exception as e:
+            self._append_log(f"Error scanning ports: {e}")
+            self.port_combo.addItem("Error scanning ports", "")
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export VE Table", "ve_table.csv", "CSV Files (*.csv)")
+    @Slot()
+    def _on_test_connection(self):
+        """Test OBD connection on selected or all available ports."""
+        selected_port = self.port_combo.currentData()
+        manual_port = self.port_input.text().strip()
 
-        if not path:
+        if manual_port:
+            port_to_test = manual_port
+        # Skip separator items
+        elif selected_port and not selected_port.startswith("---"):
+            port_to_test = selected_port
+        else:
+            # Test all available ports (both serial and Bluetooth)
+            ports = scan_all_ports()
+            if not ports:
+                QMessageBox.information(
+                    self, "Test Results", "No ports available to test.")
+                return
+
+            working_ports = []
+            self._append_log("Testing all available ports for OBD adapters...")
+
+            for port_info in ports:
+                port_name = port_info['device']
+                port_type = port_info.get('type', 'unknown')
+
+                self._append_log(f"Testing {port_type} port {port_name}...")
+
+                try:
+                    if test_obd_connection(port_name):
+                        working_ports.append(
+                            f"{port_name} - {port_info['description']} ({port_type})")
+                        self._append_log(
+                            f"✓ {port_name} has working OBD adapter")
+                    else:
+                        self._append_log(f"✗ {port_name} no OBD response")
+                except Exception as e:
+                    self._append_log(f"✗ {port_name} test error: {e}")
+
+            if working_ports:
+                msg = "Working OBD ports found:\n\n" + "\n".join(working_ports)
+                QMessageBox.information(self, "OBD Test Results", msg)
+            else:
+                QMessageBox.warning(self, "OBD Test Results",
+                                    "No working OBD adapters found.")
+            return
+
+        # Test single port
+        port_type = "Bluetooth" if port_to_test.startswith('BT:') else "Serial"
+        self._append_log(
+            f"Testing {port_type} OBD connection on {port_to_test}...")
+
+        try:
+            if test_obd_connection(port_to_test):
+                QMessageBox.information(self, "OBD Test Results",
+                                        f"✓ OBD adapter working on {port_to_test} ({port_type})")
+                self._append_log(f"✓ OBD adapter working on {port_to_test}")
+            else:
+                QMessageBox.warning(self, "OBD Test Results",
+                                    f"✗ No OBD response on {port_to_test} ({port_type})")
+                self._append_log(f"✗ No OBD response on {port_to_test}")
+        except Exception as e:
+            QMessageBox.warning(self, "OBD Test Results",
+                                f"✗ Test error on {port_to_test}: {e}")
+            self._append_log(f"✗ Test error on {port_to_test}: {e}")
+
+    @Slot()
+    def _on_cylinder_change(self):
+        self.ve_table.cylinders = int(self.cyl_spin.value())
+
+    @Slot()
+    def _on_connect(self):
+        # Get selected port from combo or manual input
+        selected_port = self.port_combo.currentData()
+        manual_port = self.port_input.text().strip()
+
+        if manual_port:
+            port = manual_port
+        elif selected_port:
+            port = selected_port
+        else:
+            port = None
+
+        tcp = self.tcp_input.text().strip() or None
+        poll_hz = int(self.poll_hz_spin.value())
+        smooth = int(self.smooth_spin.value())
+        protocol_idx = self.protocol_combo.currentIndex()
+        # map combo index to ELM327 protocol number: as per ELM327 docs -> Auto=0, J1850 PWM=1, J1850 VPW=2, ISO=3, KWP=4, CAN=6
+        protocol_map = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 6}
+        protocol_number = protocol_map.get(protocol_idx, 0)
+
+        # Validate connection settings
+        if not port and not tcp:
+            QMessageBox.warning(self, "Connection Error",
+                                "Please select a port or enter TCP host.")
+            return
+
+        # create and start worker
+        self.stop_event.clear()
+        self.worker = PollWorker(port=port, tcp_host=tcp, protocol_force=(protocol_number if protocol_number != 0 else None),
+                                 poll_commands=None, rate_hz=poll_hz, out_q=self.poll_q, stop_event=self.stop_event, smooth_win=smooth)
+        self.worker.start()
+        self.connect_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(True)
+        self.refresh_ports_btn.setEnabled(False)
+        connection_info = f"Port: {port or 'Auto'}, TCP: {tcp or 'None'}, Protocol: {protocol_number}"
+        self.log_label.setText(f"Status: Connecting... ({connection_info})")
+        self._append_log("Started poll worker")
+
+    @Slot()
+    def _on_disconnect(self):
+        if self.worker:
+            self.stop_event.set()
+            self.worker.join(timeout=2.0)
+            self.worker = None
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+        self.refresh_ports_btn.setEnabled(True)
+        self.log_label.setText("Status: Stopped")
+        self._append_log("Stopped poll worker")
+
+    @Slot()
+    def _on_save_ve(self):
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Save VE Table", os.path.expanduser("~"), "JSON Files (*.json)")
+        if not fn:
+            return
+        payload = {"rpm_bins": self.ve_table.rpm_bins, "map_bins": self.ve_table.map_bins,
+                   "cylinders": self.ve_table.cylinders, "table": self.ve_table.table}
+        with open(fn, "w") as f:
+            json.dump(payload, f, indent=2)
+        self._append_log(f"Saved VE table to {fn}")
+
+    @Slot()
+    def _on_load_ve(self):
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Load VE Table", os.path.expanduser("~"), "JSON Files (*.json)")
+        if not fn:
+            return
+        with open(fn, "r") as f:
+            payload = json.load(f)
+        # basic validation
+        if "rpm_bins" in payload and "map_bins" in payload and "table" in payload:
+            self.ve_table.rpm_bins = payload["rpm_bins"]
+            self.ve_table.map_bins = payload["map_bins"]
+            self.ve_table.table = payload["table"]
+            self.ve_table.cylinders = payload.get(
+                "cylinders", self.ve_table.cylinders)
+            self.cyl_spin.setValue(self.ve_table.cylinders)
+            # re-init GUI table
+            self._init_ve_table_widget()
+            # populate GUI from table
+            for r_idx, m in enumerate(self.ve_table.map_bins):
+                for c_idx, r in enumerate(self.ve_table.rpm_bins):
+                    val = self.ve_table.table.get(m, {}).get(r)  # type: ignore
+                    if val is None:
+                        text = ""
+                    else:
+                        text = f"{val:.3f}"
+                    self.ve_table_widget.setItem(
+                        r_idx, c_idx, QTableWidgetItem(text))
+            self._append_log(f"Loaded VE table from {fn}")
+        else:
+            QMessageBox.warning(
+                self, "Invalid file", "Selected JSON does not contain a valid VE table structure")
+
+    @Slot()
+    def _on_clear_ve(self):
+        # clear internal and GUI table
+        for m in self.ve_table.map_bins:
+            for r in self.ve_table.rpm_bins:
+                self.ve_table.table[m][r] = None
+                self.ve_table.last_updated[m][r] = None
+        self._init_ve_table_widget()
+        self._append_log("Cleared VE table")
+
+    @Slot()
+    def _on_export_ve_csv(self):
+        """Export VE table to CSV format."""
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Export VE Table to CSV", os.path.expanduser("~"), "CSV Files (*.csv)")
+        if not fn:
             return
 
         try:
-            with open(path, 'w', newline='') as f:
-                writer = csv.writer(f)
+            with open(fn, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
 
-                # Write header row with RPM values
-                header = ['MAP/RPM'] + [f"{int(r)}" for r in rpm_axis]
+                # Write header row with RPM bins
+                header = ['MAP\\RPM'] + [str(rpm)
+                                         for rpm in self.ve_table.rpm_bins]
                 writer.writerow(header)
 
-                # Write data rows
-                for m_idx in range(len(map_axis)):
-                    row = [f"{int(map_axis[m_idx])}"]
-                    for r_idx in range(len(rpm_axis)):
-                        item = self.ve_table_widget.item(m_idx, r_idx)
-                        if item and item.text() != "---":
-                            row.append(item.text())
+                # Write VE data rows
+                for map_bin in self.ve_table.map_bins:
+                    row = [str(map_bin)]
+                    for rpm_bin in self.ve_table.rpm_bins:
+                        ve_value = self.ve_table.table.get(
+                            map_bin, {}).get(rpm_bin)
+                        if ve_value is not None:
+                            row.append(f"{ve_value:.6f}")
                         else:
                             row.append("")
                     writer.writerow(row)
 
-            QMessageBox.information(self, "Export Complete",
-                                    f"VE Table exported to {path}")
-            print(f"[VE TABLE] Exported to {path}")
+            self._append_log(f"Exported VE table to CSV: {fn}")
 
         except Exception as e:
             QMessageBox.critical(self, "Export Error",
-                                 f"Failed to export: {str(e)}")
-            print(f"[VE ERROR] Export failed: {e}")
+                                 f"Failed to export VE table:\n{e}")
+            self._append_log(f"Error exporting VE table: {e}")
 
-    def build_visual_tab(self):
-        self.visual_tab = QWidget()
-        main_layout = QVBoxLayout(self.visual_tab)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
-
-        # Chart Group
-        chart_group = QGroupBox("Real-Time Data Visualization")
-        chart_layout = QVBoxLayout(chart_group)
-
-        # Create enlarged plot widget with modern styling
-        self.plot_widget = PlotWidget()
-        self.plot_widget.setMinimumHeight(600)
-        self.plot_widget.setMinimumWidth(1200)
-        self.plot_widget.setBackground('#2b2b2b')
-        self.plot_widget.setLabel('left', 'Value', color='white', size='22pt')
-        self.plot_widget.setLabel(
-            'bottom', 'Time (samples)', color='white', size='22pt')
-
-        # Style the plot
-        self.plot_widget.getAxis('left').setPen(color='white', width=4)
-        self.plot_widget.getAxis('bottom').setPen(color='white', width=4)
-        self.plot_widget.getAxis('left').setTextPen(color='white')
-        self.plot_widget.getAxis('bottom').setTextPen(color='white')
-
-        # Add grid
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-
-        # Add legend with modern styling
-        self.plot_widget.addLegend(offset=(30, 30), labelTextSize='20pt')
-
-        # Initialize data storage for multiple parameters
-        self.plot_data = {
-            'rpm': [],
-            'map': [],
-            'timing_advance': [],
-            'throttle': []
-        }
-
-        # Create plot curves with modern colors and thicker lines
-        pen_styles = {
-            'rpm': pg.mkPen(color='#ff6b6b', width=6),
-            'map': pg.mkPen(color='#4ecdc4', width=6),
-            'timing_advance': pg.mkPen(color='#45b7d1', width=6),
-            'throttle': pg.mkPen(color='#feca57', width=6)
-        }
-
-        self.plot_curves = {
-            'rpm': self.plot_widget.plot([], [], pen=pen_styles['rpm'], name='RPM'),
-            'map': self.plot_widget.plot([], [], pen=pen_styles['map'], name='MAP (kPa)'),
-            'timing_advance': self.plot_widget.plot([], [], pen=pen_styles['timing_advance'], name='Timing Advance (°)'),
-            'throttle': self.plot_widget.plot([], [], pen=pen_styles['throttle'], name='Throttle (%)')
-        }
-
-        chart_layout.addWidget(self.plot_widget)
-        main_layout.addWidget(chart_group)
-
-        self.tabs.addTab(self.visual_tab, "📈 Visualizations")
-
-    def on_port_selection_changed(self):
-        """Handle port selection changes to show/hide manual input"""
-        if self.port_select.currentData() == "MANUAL":
-            self.manual_port_input.setVisible(True)
-            self.manual_port_input.setFocus()
-        else:
-            self.manual_port_input.setVisible(False)
-
-    def convert_o2_sensor_value(self, voltage, display_format):
-        """Convert O2 sensor voltage to the selected display format"""
-        if voltage is None:
-            return "---"
-
-        # Standard conversion: 0.45V = stoichiometric (14.7:1 AFR)
-        # Lower voltage = rich mixture, higher voltage = lean mixture
-        afr = 14.7 * (voltage / 0.45)
-
-        if display_format == "Lambda (λ)":
-            # Lambda: λ = 14.7 / AFR
-            # λ = 1.0 is stoichiometric, λ < 1.0 is rich, λ > 1.0 is lean
-            lambda_ratio = 14.7 / afr
-            return f"{lambda_ratio:.3f} λ"
-        elif display_format == "Equivalence Ratio (φ)":
-            # Equivalence ratio: φ = 1 / λ
-            # φ = 1.0 is stoichiometric, φ > 1.0 is rich, φ < 1.0 is lean
-            lambda_ratio = 14.7 / afr
-            phi_ratio = 1.0 / lambda_ratio
-            return f"{phi_ratio:.3f} φ"
-        elif display_format == "Voltage (V)":
-            # Raw voltage display
-            return f"{voltage:.3f} V"
-        else:
-            return f"{voltage:.3f} V"
-
-    def on_o2_display_changed(self):
-        """Handle O2 sensor display format change"""
-        # Update log headers to reflect the new format
-        current_format = self.o2_display_combo.currentText()
-
-        if "Lambda" in current_format:
-            o2_suffix = "Lambda"
-        elif "Equivalence" in current_format:
-            o2_suffix = "Phi"
-        else:
-            o2_suffix = "Voltage"
-
-        self.log_headers = [
-            'Timestamp', 'RPM', 'Speed', 'Coolant Temp', 'MAP', 'IAT', 'Throttle', 'MAF', 'Timing Advance',
-            f'O2 B1S1 {o2_suffix}', f'O2 B2S1 {o2_suffix}'
-        ]
-
-        print(
-            f"[O2 DISPLAY] Changed to {current_format}, logging headers updated")
-
-    def scan_bluetooth(self):
-        """Scan for paired Bluetooth OBD devices and add them to the port list"""
-        import platform
-        if platform.system() != "Windows":
-            self.update_status(
-                "Bluetooth scan only supported on Windows", "warning")
+    @Slot()
+    def _on_export_data_csv(self):
+        """Export logged data to CSV format."""
+        if not self.data_log:
+            QMessageBox.information(
+                self, "No Data", "No data available to export. Start logging first.")
             return
 
-        self.update_status(
-            "Scanning for paired Bluetooth OBD devices...", "warning")
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Export Data Log to CSV", os.path.expanduser("~"), "CSV Files (*.csv)")
+        if not fn:
+            return
 
         try:
-            import subprocess
-            import re
+            with open(fn, 'w', newline='') as csvfile:
+                if not self.data_log:
+                    return
 
-            # Enhanced PowerShell command to find paired Bluetooth devices with COM ports
-            ps_command = """
-            # Get paired Bluetooth devices with COM ports
-            $devices = @()
-            
-            # Method 1: Check WMI for Bluetooth COM devices
-            Get-WmiObject -Class Win32_PnPEntity | Where-Object {
-                $_.Name -match "COM\d+" -and ($_.Name -match "Bluetooth|BT" -or $_.DeviceID -match "BTHENUM")
-            } | ForEach-Object {
-                if ($_.Name -match "(COM\d+)") {
-                    $devices += [PSCustomObject]@{
-                        Port = $matches[1]
-                        Name = $_.Name
-                        Type = "Bluetooth"
-                        Status = "Paired"
-                    }
-                }
-            }
-            
-            # Method 2: Check registry for Bluetooth serial ports
-            try {
-                $regKey = Get-ItemProperty "HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM" -ErrorAction SilentlyContinue
-                if ($regKey) {
-                    $regKey.PSObject.Properties | Where-Object {
-                        $_.Name -match "BthModem|Bluetooth" -and $_.Value -match "COM\d+"
-                    } | ForEach-Object {
-                        $comPort = $_.Value
-                        if (-not ($devices | Where-Object { $_.Port -eq $comPort })) {
-                            $devices += [PSCustomObject]@{
-                                Port = $comPort
-                                Name = "Bluetooth Serial Port"
-                                Type = "Bluetooth"
-                                Status = "Paired"
-                            }
-                        }
-                    }
-                }
-            } catch {}
-            
-            # Method 3: Check common OBD Bluetooth ports by attempting connection
-            1..20 | ForEach-Object {
-                $port = "COM$_"
-                if (-not ($devices | Where-Object { $_.Port -eq $port })) {
-                    try {
-                        $serial = New-Object System.IO.Ports.SerialPort($port, 38400)
-                        $serial.ReadTimeout = 100
-                        $serial.WriteTimeout = 100
-                        $serial.Open()
-                        Start-Sleep -Milliseconds 50
-                        $serial.Close()
-                        
-                        # If we can open the port, it might be a Bluetooth device
-                        $devices += [PSCustomObject]@{
-                            Port = $port
-                            Name = "Available Serial Port (Potential OBD)"
-                            Type = "Serial"
-                            Status = "Available"
-                        }
-                    } catch {
-                        # Port not available or in use
-                    }
-                }
-            }
-            
-            # Output results
-            $devices | Sort-Object Port | ForEach-Object {
-                Write-Output "$($_.Port)|$($_.Name)|$($_.Type)|$($_.Status)"
-            }
-            """
+                # Get all unique keys from all datapoints
+                all_keys = set()
+                for dp in self.data_log:
+                    all_keys.update(dp.keys())
 
-            result = subprocess.run(
-                ["powershell", "-Command", ps_command],
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
+                # Sort keys for consistent column order
+                sorted_keys = sorted(all_keys)
 
-            bt_devices_found = 0
-            existing_ports = [self.port_select.itemData(
-                j) for j in range(self.port_select.count())]
+                writer = csv.DictWriter(csvfile, fieldnames=sorted_keys)
+                writer.writeheader()
 
-            if result.returncode == 0 and result.stdout:
-                lines = result.stdout.strip().split('\n')
-                for line in lines:
-                    if '|' in line:
-                        try:
-                            parts = line.split('|')
-                            if len(parts) >= 4:
-                                port, name, device_type, status = parts[:4]
-                                port = port.strip()
-                                name = name.strip()
-                                device_type = device_type.strip()
-                                status = status.strip()
+                # Write all data rows
+                for dp in self.data_log:
+                    # Fill missing values with empty strings
+                    row = {key: dp.get(key, '') for key in sorted_keys}
+                    writer.writerow(row)
 
-                                if port and port not in existing_ports:
-                                    if device_type == "Bluetooth":
-                                        display_name = f"{port} (🔵 Bluetooth - {name})"
-                                        self.port_select.addItem(
-                                            display_name, port)
-                                        bt_devices_found += 1
-                                        print(
-                                            f"[BLUETOOTH] Found paired device: {port} - {name}")
-                                    elif "OBD" in name.upper() or "ELM" in name.upper():
-                                        display_name = f"{port} (🔧 Potential OBD - {name})"
-                                        self.port_select.addItem(
-                                            display_name, port)
-                                        bt_devices_found += 1
-                                        print(
-                                            f"[BLUETOOTH] Found potential OBD: {port} - {name}")
-                        except Exception as parse_error:
-                            print(
-                                f"[BLUETOOTH] Parse error for line '{line}': {parse_error}")
-                            continue
-
-            # Additional fallback: Check for common OBD Bluetooth patterns
-            try:
-                # Look for devices with OBD-related keywords
-                obd_keywords = ["OBD", "ELM327", "ELM",
-                                "OBDII", "OBD2", "DIAGNOSTIC"]
-
-                for i in range(1, 21):
-                    port_name = f"COM{i}"
-                    if port_name not in existing_ports:
-                        try:
-                            import serial as pyserial
-                            # Try to open with common OBD settings
-                            test_serial = pyserial.Serial(
-                                port_name,
-                                baudrate=38400,  # Common OBD baud rate
-                                timeout=0.5,
-                                write_timeout=0.5
-                            )
-
-                            # Send AT command to test if it's an OBD device
-                            test_serial.write(b'ATZ\r')  # Reset command
-                            test_serial.flush()
-                            time.sleep(0.2)
-
-                            response = test_serial.read(100)
-                            test_serial.close()
-
-                            if response and (b'ELM' in response or b'OK' in response or b'>' in response):
-                                display_name = f"{port_name} (🔧 Detected OBD Device)"
-                                self.port_select.addItem(
-                                    display_name, port_name)
-                                bt_devices_found += 1
-                                print(
-                                    f"[BLUETOOTH] Detected OBD device on {port_name}: {response}")
-                            elif len(response) > 0:  # Some response, might be Bluetooth
-                                display_name = f"{port_name} (🔵 Bluetooth Device)"
-                                self.port_select.addItem(
-                                    display_name, port_name)
-                                bt_devices_found += 1
-                                print(
-                                    f"[BLUETOOTH] Detected Bluetooth device on {port_name}")
-
-                        except Exception as test_error:
-                            # Port not available, in use, or not responsive
-                            continue
-
-            except Exception as fallback_error:
-                print(f"[BLUETOOTH] Fallback scan error: {fallback_error}")
-
-            if bt_devices_found > 0:
-                self.update_status(
-                    f"Found {bt_devices_found} Bluetooth/OBD devices", "success")
-                print(
-                    f"[BLUETOOTH] Successfully found {bt_devices_found} devices")
-            else:
-                self.update_status(
-                    "No Bluetooth OBD devices found. Check pairing and try manual entry.", "warning")
-                print("[BLUETOOTH] No devices found - check if OBD adapter is paired")
+            self._append_log(
+                f"Exported {len(self.data_log)} data points to CSV: {fn}")
 
         except Exception as e:
-            print(f"[BLUETOOTH] Scan error: {e}")
-            self.update_status(
-                "Bluetooth scan failed. Try manual COM port entry.", "error")
+            QMessageBox.critical(self, "Export Error",
+                                 f"Failed to export data log:\n{e}")
+            self._append_log(f"Error exporting data log: {e}")
 
-    def refresh_ports(self):
-        """Refresh and populate the port selection with all available serial ports"""
-        self.port_select.clear()
+    @Slot()
+    def _on_clear_data_log(self):
+        """Clear the data log."""
+        self.data_log.clear()
+        self._append_log(f"Cleared data log")
+        QMessageBox.information(self, "Data Log Cleared",
+                                "Data log has been cleared.")
 
-        # Get standard serial ports with enhanced descriptions
-        ports = serial.tools.list_ports.comports()
-        bluetooth_ports = []
-        standard_ports = []
+    def _append_log(self, s):
+        t = time.strftime("%H:%M:%S")
+        self.log_label.setText(f"Status: {s} ({t})")
 
-        for port in ports:
-            description = f"{port.device}"
-            port_info = ""
-
-            # Enhanced description with device details
-            if port.description and port.description != "n/a":
-                port_info = f" ({port.description})"
-
-            # Check for Bluetooth indicators
-            is_bluetooth = any(bt_keyword in port.description.lower() if port.description else ""
-                               for bt_keyword in ["bluetooth", "bth", "bt"])
-
-            # Check for OBD indicators
-            is_obd = any(obd_keyword in port.description.lower() if port.description else ""
-                         for obd_keyword in ["elm327", "elm", "obd", "diagnostic"])
-
-            if is_bluetooth or is_obd:
-                if is_obd:
-                    display_name = f"{description} 🔧 OBD{port_info}"
-                else:
-                    display_name = f"{description} 🔵 Bluetooth{port_info}"
-                bluetooth_ports.append((display_name, port.device))
+    def _on_gui_timer(self):
+        # Check worker connection status
+        if self.worker:
+            if self.worker.connected:
+                self.connection_status_label.setText("Connection: Connected ✓")
+                self.connection_status_label.setStyleSheet("color: green;")
             else:
-                display_name = f"{description}{port_info}"
-                standard_ports.append((display_name, port.device))
-
-        # Add Bluetooth ports first (higher priority)
-        for display_name, device in bluetooth_ports:
-            self.port_select.addItem(display_name, device)
-
-        # Add standard ports
-        for display_name, device in standard_ports:
-            self.port_select.addItem(display_name, device)
-
-        # Windows-specific Bluetooth port detection
-        import platform
-        if platform.system() == "Windows":
-            try:
-                import winreg
-                existing_ports = [self.port_select.itemData(
-                    j) for j in range(self.port_select.count())]
-
-                # Check registry for additional Bluetooth COM ports
-                key_path = r"HARDWARE\DEVICEMAP\SERIALCOMM"
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
-                    i = 0
-                    while True:
-                        try:
-                            name, value, _ = winreg.EnumValue(key, i)
-                            if ("BthModem" in name or "Bluetooth" in name) and value not in existing_ports:
-                                self.port_select.addItem(
-                                    f"{value} 🔵 Registry Bluetooth", value)
-                                print(
-                                    f"[PORTS] Found registry Bluetooth port: {value}")
-                            i += 1
-                        except WindowsError:
-                            break
-            except Exception as e:
-                print(f"[PORTS] Registry scan error: {e}")
-
-            # Enhanced Bluetooth port probing with better detection
-            try:
-                existing_ports = [self.port_select.itemData(
-                    j) for j in range(self.port_select.count())]
-
-                for i in range(1, 21):  # COM1 to COM20
-                    port_name = f"COM{i}"
-                    if port_name not in existing_ports:
-                        try:
-                            import serial as pyserial
-                            import time
-
-                            # Try multiple common OBD/Bluetooth baud rates
-                            baud_rates = [38400, 9600, 115200]
-                            device_detected = False
-                            device_type = "Unknown"
-
-                            for baud_rate in baud_rates:
-                                if device_detected:
-                                    break
-
-                                try:
-                                    test_serial = pyserial.Serial(
-                                        port_name,
-                                        baudrate=baud_rate,
-                                        timeout=0.3,
-                                        write_timeout=0.3
-                                    )
-
-                                    # Test if it's an OBD device
-                                    test_serial.write(b'ATZ\r\n')
-                                    test_serial.flush()
-                                    time.sleep(0.2)
-
-                                    response = test_serial.read(50)
-                                    test_serial.close()
-
-                                    if response:
-                                        response_str = response.decode(
-                                            'ascii', errors='ignore').upper()
-                                        if any(obd_resp in response_str for obd_resp in ['ELM327', 'ELM', 'OK', '>']):
-                                            device_type = "OBD Device"
-                                            device_detected = True
-                                            print(
-                                                f"[PORTS] Detected OBD device on {port_name} at {baud_rate} baud: {response_str[:20]}")
-                                        # Some response indicates active device
-                                        elif len(response) > 2:
-                                            device_type = "Bluetooth Device"
-                                            device_detected = True
-                                            print(
-                                                f"[PORTS] Detected Bluetooth device on {port_name} at {baud_rate} baud")
-
-                                except Exception as test_error:
-                                    continue  # Try next baud rate
-
-                            if device_detected:
-                                if "OBD" in device_type:
-                                    display_name = f"{port_name} 🔧 Detected {device_type}"
-                                else:
-                                    display_name = f"{port_name} 🔵 Detected {device_type}"
-                                self.port_select.addItem(
-                                    display_name, port_name)
-
-                        except Exception as port_error:
-                            continue  # Port not available or permission denied
-
-            except Exception as probe_error:
-                print(f"[PORTS] Bluetooth probe error: {probe_error}")
-
-        # If no ports found, show helpful message
-        if self.port_select.count() == 0:
-            self.port_select.addItem(
-                "⚠️ No ports detected - Try pairing Bluetooth OBD or manual entry", "")
-
-        # Add manual entry option at the end
-        self.port_select.addItem("✏️ Manual Entry (Type COM port)", "MANUAL")
-
-        print(
-            f"[PORTS] Refresh complete: {self.port_select.count()-1} ports found")
-
-    def connect_obd(self):
-        """Enhanced OBD connection with robust Bluetooth support and retry logic"""
-        # Get the selected port
-        if self.port_select.currentData() == "MANUAL" or self.manual_port_input.isVisible():
-            port = self.manual_port_input.text().strip()
+                self.connection_status_label.setText(
+                    "Connection: Trying to connect...")
+                self.connection_status_label.setStyleSheet("color: orange;")
         else:
-            port = self.port_select.currentData(
-            ) or self.port_select.currentText().split()[0]
+            self.connection_status_label.setText("Connection: Not connected")
+            self.connection_status_label.setStyleSheet("color: red;")
 
-        if not port:
-            self.update_status("No port selected", "error")
-            return
+        # Update data log status
+        log_count = len(self.data_log)
+        self.data_log_status_label.setText(f"Data Log: {log_count} entries")
+        if log_count > self.max_log_entries * 0.9:  # Warn when approaching limit
+            self.data_log_status_label.setStyleSheet("color: orange;")
+        else:
+            self.data_log_status_label.setStyleSheet("color: blue;")
 
-        self.connect_btn.setText("🔄 Connecting...")
-        self.connect_btn.setEnabled(False)
+        # drain poll queue
+        updated = False
+        last_dp = None
+        while not self.poll_q.empty():
+            try:
+                dp = self.poll_q.get_nowait()
+            except queue.Empty:
+                break
+            last_dp = dp
+            updated = True
 
-        # Determine if this is a Bluetooth connection
-        is_bluetooth = any(bt_indicator in self.port_select.currentText().lower()
-                           for bt_indicator in ["bluetooth", "🔵", "bth"])
+            # Add timestamp in readable format for CSV export
+            dp_for_log = dp.copy()
+            timestamp_ms = dp.get('timestamp', int(time.time() * 1000))
+            dp_for_log['datetime'] = time.strftime(
+                '%Y-%m-%d %H:%M:%S', time.localtime(timestamp_ms / 1000))
 
-        # Determine if this is likely an OBD device
-        is_obd_device = any(obd_indicator in self.port_select.currentText().lower()
-                            for obd_indicator in ["obd", "elm", "🔧", "diagnostic"])
+            # Store datapoint for CSV export (with size limit)
+            self.data_log.append(dp_for_log)
+            if len(self.data_log) > self.max_log_entries:
+                self.data_log.pop(0)  # Remove oldest entry
 
-        print(f"[CONNECTION] Attempting to connect to {port}")
-        print(
-            f"[CONNECTION] Bluetooth: {is_bluetooth}, OBD Device: {is_obd_device}")
-
-        if OBD_AVAILABLE:
-            # Enhanced connection attempt with multiple strategies
-            connection_attempts = []
-
-            if is_bluetooth or is_obd_device:
-                # Strategy 1: Bluetooth-optimized settings
-                connection_attempts.append({
-                    'name': 'Bluetooth Optimized',
-                    'timeout': 15,
-                    'check_voltage': False,
-                    'fast': False,
-                    'protocol': None
-                })
-
-                # Strategy 2: ELM327 specific settings
-                connection_attempts.append({
-                    'name': 'ELM327 Specific',
-                    'timeout': 10,
-                    'check_voltage': False,
-                    'fast': True,
-                    'protocol': '6'  # CAN 11-bit 500kb
-                })
-
-                # Strategy 3: Basic Bluetooth settings
-                connection_attempts.append({
-                    'name': 'Basic Bluetooth',
-                    'timeout': 8,
-                    'check_voltage': False,
-                    'fast': False,
-                    'protocol': None
-                })
+            # update plotting buffers
+            if dp.get('rpm') is not None:
+                self.buffers['rpm'].append(dp.get('rpm'))
             else:
-                # Strategy for standard serial connections
-                connection_attempts.append({
-                    'name': 'Standard Serial',
-                    'timeout': 5,
-                    'check_voltage': True,
-                    'fast': False,
-                    'protocol': None
-                })
+                self.buffers['rpm'].append(0)
+            if dp.get('maf') is not None:
+                self.buffers['maf'].append(dp.get('maf'))
+            else:
+                self.buffers['maf'].append(0)
+            if dp.get('map') is not None:
+                self.buffers['map'].append(dp.get('map'))
+            else:
+                self.buffers['map'].append(0)
 
-            # Try each connection strategy
-            for i, strategy in enumerate(connection_attempts):
+            # update live labels
+            self.rpm_label.setText(f"RPM: {dp.get('rpm', '—')}")
+            self.maf_label.setText(f"MAF (g/s): {dp.get('maf', '—')}")
+            self.map_label.setText(f"MAP (kPa): {dp.get('map', '—')}")
+            self.iat_label.setText(f"IAT (°C): {dp.get('iat', '—')}")
+
+            # if we have maf, rpm, iat, map -> compute VE and update table
+            maf = dp.get('maf')
+            rpm = dp.get('rpm')
+            iat = dp.get('iat')
+            map_kpa = dp.get('map')
+            timestamp = dp.get('timestamp', time.time())
+            result = self.ve_table.update_from_measurement(
+                maf, rpm, iat, map_kpa, timestamp=timestamp)
+            if result:
+                rpm_bin, map_bin, ve_val = result
+                # update GUI cell
                 try:
-                    self.update_status(
-                        f"Trying {strategy['name']} connection... ({i+1}/{len(connection_attempts)})", "warning")
-                    print(f"[CONNECTION] Strategy {i+1}: {strategy['name']}")
+                    r_idx = self.ve_table.map_bins.index(map_bin)
+                    c_idx = self.ve_table.rpm_bins.index(rpm_bin)
+                    item = QTableWidgetItem(f"{ve_val:.4f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.ve_table_widget.setItem(r_idx, c_idx, item)
+                    # highlight updated cell
+                    for rr in range(self.ve_table_widget.rowCount()):
+                        for cc in range(self.ve_table_widget.columnCount()):
+                            it = self.ve_table_widget.item(rr, cc)
+                            if it:
+                                it.setBackground(QColor("white"))
+                    item.setBackground(QColor("yellow"))
+                except Exception:
+                    pass
 
-                    # Pre-connection test for Bluetooth devices
-                    if is_bluetooth:
-                        if not self.test_bluetooth_port(port):
-                            print(
-                                f"[CONNECTION] Bluetooth port {port} pre-test failed")
-                            continue
-
-                    # Build connection parameters
-                    connection_params = {
-                        'portstr': port,
-                        'timeout': strategy['timeout'],
-                        'check_voltage': strategy['check_voltage'],
-                        'fast': strategy['fast']
-                    }
-
-                    if strategy['protocol']:
-                        connection_params['protocol'] = strategy['protocol']
-
-                    # Attempt connection
-                    self.connection = obd.OBD(**connection_params)
-
-                    if self.connection and self.connection.is_connected():
-                        # Connection successful
-                        self.connect_btn.setText("✅ Connected")
-                        connection_type = "Bluetooth" if is_bluetooth else "Serial"
-                        self.update_status(
-                            f"Connected to {port} via {connection_type} - REAL DATA", "success")
-
-                        # Get supported commands info
-                        supported_commands = len(
-                            self.connection.supported_commands)
-                        protocol = getattr(
-                            self.connection, 'protocol', 'Unknown')
-
-                        self.info_label.setText(
-                            f"Successfully connected to OBD device on {port} using {strategy['name']}.\n"
-                            f"Protocol: {protocol}, Supported Commands: {supported_commands}\n"
-                            f"Using REAL sensor data only."
-                        )
-
-                        print(
-                            f"[CONNECTION] Success with {strategy['name']} - Protocol: {protocol}, Commands: {supported_commands}")
-
-                        # Start data collection
-                        self.timer.start(500)
-                        self.disconnect_btn.setEnabled(True)
-                        return
-                    else:
-                        print(
-                            f"[CONNECTION] Strategy {strategy['name']} failed - not connected")
-                        if self.connection:
-                            self.connection.close()
-                            self.connection = None
-                        continue
-
-                except Exception as e:
-                    print(
-                        f"[CONNECTION] Strategy {strategy['name']} exception: {e}")
-                    if hasattr(self, 'connection') and self.connection:
-                        try:
-                            self.connection.close()
-                        except:
-                            pass
-                        self.connection = None
-                    continue
-
-            # All connection attempts failed
-            self.connect_btn.setText("❌ Connection Failed")
-            self.connect_btn.setEnabled(True)
-
-            if is_bluetooth:
-                error_msg = (
-                    f"Failed to connect to Bluetooth OBD device on {port}.\n\n"
-                    "Troubleshooting:\n"
-                    "• Ensure the OBD adapter is paired in Windows Bluetooth settings\n"
-                    "• Check that the device is plugged into your vehicle's OBD port\n"
-                    "• Turn on your vehicle's ignition (engine doesn't need to run)\n"
-                    "• Try disconnecting and reconnecting the Bluetooth adapter\n"
-                    "• Some adapters require the engine to be running"
-                )
-            else:
-                error_msg = (
-                    f"Failed to establish connection on {port}.\n"
-                    "Check device connection, port selection, and try again."
-                )
-
-            self.update_status(
-                "Connection failed - See troubleshooting tips", "error")
-            self.info_label.setText(error_msg)
-        else:
-            # Demo mode fallback
-            self.connection = "DEMO"
-            self.connect_btn.setText("🎮 Demo Mode")
-            self.update_status("Demo Mode Active - SIMULATED DATA", "warning")
-            self.info_label.setText(
-                "Running in demo mode with simulated data for testing purposes only")
-            self.timer.start(500)
-
-    def disconnect_obd(self):
-        """Disconnect from OBD device and clean up connection"""
-        try:
-            # Stop the data timer first
-            if hasattr(self, 'timer') and self.timer.isActive():
-                self.timer.stop()
-
-            # Close the OBD connection
-            if hasattr(self, 'connection') and self.connection and self.connection != "DEMO":
-                try:
-                    self.connection.close()
-                    print("[DISCONNECT] OBD connection closed successfully")
-                except Exception as e:
-                    print(f"[DISCONNECT] Error closing connection: {e}")
-
-            # Reset connection state
-            self.connection = None
-
-            # Update UI
-            self.connect_btn.setText("🔌 Connect to ELM327")
-            self.connect_btn.setEnabled(True)
-            self.disconnect_btn.setEnabled(False)
-            self.update_status("Disconnected", "warning")
-            self.info_label.setText(
-                "Select a port and click connect to start monitoring")
-
-            # Clear gauge displays
-            for cmd, label in self.labels.items():
-                label.setText("---")
-
-            # Update window title
-            self.setWindowTitle("OBD-II Professional Monitor & VE Calculator")
-
-            print("[DISCONNECT] Disconnection completed successfully")
-
-        except Exception as e:
-            print(f"[DISCONNECT] Error during disconnection: {e}")
-            self.update_status("Disconnect error", "error")
-
-    def test_bluetooth_port(self, port):
-        """Test if a Bluetooth port is responsive before attempting OBD connection"""
-        try:
-            import serial as pyserial
-            import time
-
-            print(f"[BT_TEST] Testing Bluetooth port {port}")
-
-            # Try to establish basic serial communication
-            test_serial = pyserial.Serial(
-                port,
-                baudrate=38400,  # Common OBD baud rate
-                timeout=2,
-                write_timeout=2,
-                bytesize=8,
-                parity='N',
-                stopbits=1
-            )
-
-            time.sleep(0.5)  # Allow connection to stabilize
-
-            # Clear any existing data
-            test_serial.reset_input_buffer()
-            test_serial.reset_output_buffer()
-
-            # Send a basic AT command
-            test_serial.write(b'ATZ\r')
-            test_serial.flush()
-            time.sleep(1)
-
-            # Read response
-            response = test_serial.read(100)
-            test_serial.close()
-
-            if response:
-                response_str = response.decode('ascii', errors='ignore')
-                print(f"[BT_TEST] Port {port} responded: {response_str[:50]}")
-                return True
-            else:
-                print(f"[BT_TEST] Port {port} no response")
-                return False
-
-        except Exception as e:
-            print(f"[BT_TEST] Port {port} test failed: {e}")
-            return False
-
-    def update_status(self, text, status_type):
-        """Update connection status with appropriate styling"""
-        colors = {
-            'success': MODERN_STYLE['success'],
-            'error': MODERN_STYLE['error'],
-            'warning': MODERN_STYLE['warning']
-        }
-
-        color = colors.get(status_type, MODERN_STYLE['text_secondary'])
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"""
-            QLabel {{
-                color: {color};
-                font-size: 16px;
-                font-weight: 600;
-                padding: 10px;
-                background-color: rgba({color[1:3]}, {color[3:5]}, {color[5:7]}, 0.1);
-                border: 1px solid {color};
-                border-radius: 6px;
-            }}
-        """)
-
-    def update_pids(self):
-        if not self.connection:
-            return
-
-        # Update header with data source indicator
-        if self.connection == "DEMO":
-            self.setWindowTitle(
-                "OBD-II Professional Monitor & VE Calculator - DEMO MODE (SIMULATED DATA)")
-        else:
-            self.setWindowTitle(
-                "OBD-II Professional Monitor & VE Calculator - CONNECTED (REAL DATA)")
-
-        rpm = self.get_value(obd.commands.RPM)
-        map_kpa = self.get_value(obd.commands.INTAKE_PRESSURE)
-        temp_k = self.get_value(obd.commands.INTAKE_TEMP, "kelvin")
-        timing_advance = self.get_value(obd.commands.TIMING_ADVANCE)
-        throttle = self.get_value(obd.commands.THROTTLE_POS)
-        o2_b1s1 = self.get_value(obd.commands.O2_B1S1)
-        o2_b2s1 = self.get_value(obd.commands.O2_B2S1)
-
-        # Prepare log row
-        log_row = [time.strftime("%Y-%m-%d %H:%M:%S")]
-        values = {}
-        for cmd, label in self.labels.items():
-            val = self.get_value(cmd)
-            values[cmd] = val
-            if val is not None:
-                if cmd == obd.commands.TIMING_ADVANCE:
-                    label.setText(f"{val:.1f}°")
-                elif cmd == obd.commands.INTAKE_PRESSURE:
-                    label.setText(f"{val:.1f}")
-                elif cmd == obd.commands.THROTTLE_POS:
-                    label.setText(f"{val:.1f}%")
-                elif cmd == obd.commands.RPM:
-                    label.setText(f"{val:.0f}")
-                elif cmd == obd.commands.SPEED:
-                    label.setText(f"{val:.0f}")
-                elif cmd == obd.commands.COOLANT_TEMP:
-                    label.setText(f"{val:.1f}°C")
-                elif cmd == obd.commands.INTAKE_TEMP:
-                    if val > 200:  # Kelvin
-                        label.setText(f"{val-273.15:.1f}°C")
-                    else:
-                        label.setText(f"{val:.1f}°C")
-                elif cmd == obd.commands.MAF:
-                    label.setText(f"{val:.2f}")
-                elif cmd == obd.commands.O2_B1S1:
-                    # Use the selected display format for O2 sensors
-                    display_format = getattr(self, 'o2_display_combo', None)
-                    if display_format:
-                        formatted_value = self.convert_o2_sensor_value(
-                            val, display_format.currentText())
-                        label.setText(formatted_value)
-                    else:
-                        # Fallback to lambda if combo box not available
-                        afr = 14.7 * (val / 0.45)
-                        lambda_ratio = 14.7 / afr
-                        label.setText(f"{lambda_ratio:.3f} λ")
-                elif cmd == obd.commands.O2_B2S1:
-                    # Use the selected display format for O2 sensors
-                    display_format = getattr(self, 'o2_display_combo', None)
-                    if display_format:
-                        formatted_value = self.convert_o2_sensor_value(
-                            val, display_format.currentText())
-                        label.setText(formatted_value)
-                    else:
-                        # Fallback to lambda if combo box not available
-                        afr = 14.7 * (val / 0.45)
-                        lambda_ratio = 14.7 / afr
-                        label.setText(f"{lambda_ratio:.3f} λ")
-                else:
-                    label.setText(f"{val:.2f}")
-            else:
-                label.setText("---")
-
-        # Only log if logging is enabled
-        if self.logging_enabled:
-            def safe(val):
-                return "" if val is None else val
-            log_row.append(safe(values.get(obd.commands.RPM)))
-            log_row.append(safe(values.get(obd.commands.SPEED)))
-            log_row.append(safe(values.get(obd.commands.COOLANT_TEMP)))
-            log_row.append(safe(values.get(obd.commands.INTAKE_PRESSURE)))
-            log_row.append(safe(values.get(obd.commands.INTAKE_TEMP)))
-            log_row.append(safe(values.get(obd.commands.THROTTLE_POS)))
-            log_row.append(safe(values.get(obd.commands.MAF)))
-            log_row.append(safe(values.get(obd.commands.TIMING_ADVANCE)))
-            # O2 sensors in the selected format
-            o2b1 = values.get(obd.commands.O2_B1S1)
-            o2b2 = values.get(obd.commands.O2_B2S1)
-
-            # Get current display format for logging
-            display_format = getattr(self, 'o2_display_combo', None)
-            current_format = display_format.currentText() if display_format else "Lambda (λ)"
-
-            # Convert O2 values according to selected format
-            if o2b1 is not None:
-                if "Lambda" in current_format:
-                    afr1 = 14.7 * (o2b1 / 0.45)
-                    o2_value1 = 14.7 / afr1  # Lambda
-                elif "Equivalence" in current_format:
-                    afr1 = 14.7 * (o2b1 / 0.45)
-                    lambda1 = 14.7 / afr1
-                    o2_value1 = 1.0 / lambda1  # Phi (equivalence ratio)
-                else:  # Voltage
-                    o2_value1 = o2b1
-            else:
-                o2_value1 = ""
-
-            if o2b2 is not None:
-                if "Lambda" in current_format:
-                    afr2 = 14.7 * (o2b2 / 0.45)
-                    o2_value2 = 14.7 / afr2  # Lambda
-                elif "Equivalence" in current_format:
-                    afr2 = 14.7 * (o2b2 / 0.45)
-                    lambda2 = 14.7 / afr2
-                    o2_value2 = 1.0 / lambda2  # Phi (equivalence ratio)
-                else:  # Voltage
-                    o2_value2 = o2b2
-            else:
-                o2_value2 = ""
-
-            log_row.append(o2_value1)
-            log_row.append(o2_value2)
-            self.log_data.append(log_row)
-
-        # --- VE Table Update: Only update the cell for the current real-time sensor values ---
-        maf = self.get_value(obd.commands.MAF)  # Mass Air Flow in grams/sec
-        num_cyl = 8  # Number of cylinders (8-cylinder engine)
-
-        # Debug: Print all sensor values for troubleshooting with data source indicator
-        data_source = "DEMO" if self.connection == "DEMO" else "REAL"
-        print(
-            f"[SENSOR DEBUG - {data_source}] RPM={rpm}, MAP={map_kpa}, MAF={maf}, TempK={temp_k}")
-
-        # Ensure all variables are valid and positive for VE calculation
-        if (maf is not None and maf > 0 and
-            rpm is not None and rpm > 0 and
-            map_kpa is not None and map_kpa > 0 and
-            temp_k is not None and temp_k > 0 and
-                num_cyl > 0):
-
-            # Find closest indices for current RPM and MAP in the table
-            r_idx = int(np.abs(rpm_axis - rpm).argmin())
-            m_idx = int(np.abs(map_axis - map_kpa).argmin())
-
+        if updated and last_dp is not None:
+            # update plots (simple indexing x axis)
+            xs = list(range(len(self.buffers['rpm'])))
             try:
-                # VE Calculation Formula:
-                # g_per_cyl = (MAF * 60) / (RPM/2 * num_cyl)  [corrected formula]
-                # The factor of 60 converts from grams/sec to grams/min
-                # RPM/2 because there are 2 crankshaft revolutions per engine cycle (4-stroke)
-                g_per_cyl = (maf * 60) / ((rpm / 2) * num_cyl)
+                self.rpm_curve.setData(xs, list(self.buffers['rpm']))
+                self.maf_curve.setData(xs, list(self.buffers['maf']))
+                self.map_curve.setData(xs, list(self.buffers['map']))
+            except Exception:
+                pass
 
-                # VE = (g_per_cyl * Temp_K) / MAP_kPa
-                # This gives volumetric efficiency as a dimensionless ratio
-                ve = (g_per_cyl * temp_k) / map_kpa
+    def closeEvent(self, event):
+        self._on_disconnect()
+        event.accept()
 
-                # Update the specific cell in the VE table
-                item = QTableWidgetItem(f"{ve:.3f}")
-                item.setTextAlignment(Qt.AlignCenter)
 
-                # Color code the cell based on VE value for visual feedback (adjusted for 8-cylinder engine)
-                if ve > 0.45:
-                    # Green for high VE (8-cyl: >0.45 vs 4-cyl: >0.9)
-                    item.setBackground(QColor(16, 124, 16, 100))
-                elif ve > 0.35:
-                    # Orange for medium VE (8-cyl: >0.35 vs 4-cyl: >0.7)
-                    item.setBackground(QColor(255, 140, 0, 100))
-                else:
-                    # Red for low VE (8-cyl: ≤0.35 vs 4-cyl: ≤0.7)
-                    item.setBackground(QColor(209, 52, 56, 100))
-
-                # Add visual indicator for demo vs real data
-                if self.connection == "DEMO":
-                    # Gray overlay for demo data
-                    item.setBackground(QColor(128, 128, 128, 80))
-
-                self.ve_table_widget.setItem(m_idx, r_idx, item)
-
-                print(
-                    f"[VE CALCULATED - {data_source}] RPM={rpm}, MAP={map_kpa}kPa, MAF={maf}g/s, TempK={temp_k}K, VE={ve:.3f} at table[{m_idx},{r_idx}]")
-
-            except Exception as ve_ex:
-                print(f"[VE ERROR] Calculation failed: {ve_ex}")
-        else:
-            # Log why VE calculation was skipped
-            missing_sensors = []
-            if maf is None or maf <= 0:
-                missing_sensors.append("MAF")
-            if rpm is None or rpm <= 0:
-                missing_sensors.append("RPM")
-            if map_kpa is None or map_kpa <= 0:
-                missing_sensors.append("MAP")
-            if temp_k is None or temp_k <= 0:
-                missing_sensors.append("IAT")
-
-            if missing_sensors:
-                print(
-                    f"[VE SKIP - {data_source}] Missing or invalid sensors: {', '.join(missing_sensors)}")
-
-        # Do not clear or overwrite the rest of the table - preserve historical data
-
-        # --- Update visualizations with multiple data series ---
-        max_samples = 100
-
-        # Update RPM data
-        if rpm is not None:
-            self.plot_data['rpm'].append(rpm)
-            if len(self.plot_data['rpm']) > max_samples:
-                self.plot_data['rpm'] = self.plot_data['rpm'][-max_samples:]
-            self.plot_curves['rpm'].setData(self.plot_data['rpm'])
-
-        # Update MAP data
-        if map_kpa is not None:
-            self.plot_data['map'].append(map_kpa)
-            if len(self.plot_data['map']) > max_samples:
-                self.plot_data['map'] = self.plot_data['map'][-max_samples:]
-            self.plot_curves['map'].setData(self.plot_data['map'])
-
-        # Update Timing Advance data
-        if timing_advance is not None:
-            self.plot_data['timing_advance'].append(timing_advance)
-            if len(self.plot_data['timing_advance']) > max_samples:
-                self.plot_data['timing_advance'] = self.plot_data['timing_advance'][-max_samples:]
-            self.plot_curves['timing_advance'].setData(
-                self.plot_data['timing_advance'])
-
-        # Update Throttle data
-        if throttle is not None:
-            self.plot_data['throttle'].append(throttle)
-            if len(self.plot_data['throttle']) > max_samples:
-                self.plot_data['throttle'] = self.plot_data['throttle'][-max_samples:]
-            self.plot_curves['throttle'].setData(self.plot_data['throttle'])
-
-        # Update Throttle data
-        if throttle is not None:
-            self.plot_data['throttle'].append(throttle)
-            if len(self.plot_data['throttle']) > max_samples:
-                self.plot_data['throttle'] = self.plot_data['throttle'][-max_samples:]
-            self.plot_curves['throttle'].setData(self.plot_data['throttle'])
-
-    def get_value(self, cmd, to_unit=None):
-        if not self.connection:
-            return None
-
-        # Demo mode ONLY - never use simulated data when connected to real device
-        if self.connection == "DEMO":
-            # Return simulated values that correlate for realistic VE calculations
-            if cmd == obd.commands.RPM:
-                return random.randint(800, 6000)
-            elif cmd == obd.commands.SPEED:
-                return random.randint(0, 120)
-            elif cmd == obd.commands.COOLANT_TEMP:
-                return random.randint(80, 95)
-            elif cmd == obd.commands.MAP or cmd == obd.commands.INTAKE_PRESSURE:
-                return random.randint(20, 100)
-            elif cmd == obd.commands.INTAKE_TEMP or cmd == obd.commands.INTAKE_AIR_TEMP:
-                temp_c = random.randint(20, 60)
-                return temp_c + 273.15 if to_unit == "kelvin" else temp_c
-            elif cmd == obd.commands.THROTTLE_POS:
-                return random.uniform(0, 100)
-            elif cmd == obd.commands.MAF:
-                # More realistic MAF values that correlate with typical engine operation
-                return random.uniform(3.0, 45.0)
-            elif cmd == obd.commands.TIMING_ADVANCE:
-                # Typical timing advance range in degrees
-                return random.uniform(-5, 35)
-            elif cmd == obd.commands.O2_B1S1 or cmd == obd.commands.O2_B2S1:
-                # Realistic O2 sensor voltage (0.1-0.9V)
-                return random.uniform(0.1, 0.9)
-            return random.uniform(10, 100)
-
-        # Real OBD connection - ONLY use actual sensor data
-        try:
-            if not self.connection.supports(cmd):
-                print(f"[OBD WARNING] Command {cmd} not supported by vehicle")
-                return None
-
-            response = self.connection.query(cmd)
-            if response.is_null():
-                print(f"[OBD WARNING] No data received for {cmd}")
-                return None
-
-            if to_unit:
-                return float(response.value.to(to_unit).magnitude)
-            return float(response.value.magnitude)
-
-        except Exception as e:
-            print(f"[OBD ERROR] Failed to get {cmd}: {e}")
-            return None
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    try:
-        app = QApplication(sys.argv)
-        win = OBDApp()
-        win.show()
-        sys.exit(app.exec_())
-    except Exception as e:
-        print(f"Application startup error: {e}")
-        import traceback
-        traceback.print_exc()
-        input("Press Enter to exit...")  # Keep console open to see error
+    main()
